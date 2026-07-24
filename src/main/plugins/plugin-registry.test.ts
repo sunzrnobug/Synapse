@@ -340,6 +340,24 @@ describe("pluginRegistry", () => {
     expect(registry.listTools()).toHaveLength(0)
   })
 
+  it("logs the underlying error and stack when a plugin crashes, so main.log carries the root cause", async () => {
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {})
+    const sandbox = fakeSandbox()
+    const crash = new Error("Invalid IP address: undefined")
+    sandbox.invokeTool = vi.fn<PluginSandboxRuntime["invokeTool"]>(() => {
+      throw crash
+    })
+    const registry = new PluginRegistry({ sandbox })
+    await registry.load([discovered({ tools: [toolDef("greet")] })])
+
+    await expect(registry.invokeTool("com.synapse.test", "greet", {}, options())).rejects.toThrow()
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      "plugin crashed",
+      expect.objectContaining({ pluginId: "com.synapse.test", err: crash })
+    )
+  })
+
   it("passes PermissionDenied through invokeTool without crashing the plugin", async () => {
     const sandbox = fakeSandbox()
     sandbox.invokeTool = vi.fn<PluginSandboxRuntime["invokeTool"]>(() => {

@@ -426,6 +426,7 @@ export class PluginRegistry extends EventEmitter<PluginRegistryEvents> {
   private markCrashed(pluginId: string, err: unknown): void {
     const entry = this.entries.get(pluginId)
     if (!entry) return
+    logger.error("plugin crashed", { pluginId, err })
     this.removeCommands(pluginId)
     this.removeTools(pluginId)
     this.clipboardChangeListeners.delete(pluginId)
