@@ -1,7 +1,8 @@
 import { globalShortcut } from "electron"
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
   bindGlobalShortcut,
+  bindGlobalShortcutWithRetry,
   currentBinding,
   resumeGlobalShortcut,
   suspendGlobalShortcut,
@@ -56,5 +57,63 @@ describe("suspendGlobalShortcut / resumeGlobalShortcut", () => {
     vi.mocked(globalShortcut.register).mockReturnValue(false)
 
     expect(resumeGlobalShortcut(() => {})).toBe(false)
+  })
+})
+
+describe("bindGlobalShortcutWithRetry", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    unbindGlobalShortcut()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("succeeds immediately without waiting when the first registration succeeds", async () => {
+    vi.mocked(globalShortcut.register).mockReturnValue(true)
+
+    const ok = await bindGlobalShortcutWithRetry("Control+Space", () => {}, {
+      retries: 3,
+      delayMs: 300,
+    })
+
+    expect(ok).toBe(true)
+    expect(globalShortcut.register).toHaveBeenCalledTimes(1)
+  })
+
+  it("retries with a delay when the OS still holds the accelerator from a just-exited process, and succeeds once released", async () => {
+    vi.useFakeTimers()
+    vi.mocked(globalShortcut.register)
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true)
+
+    const resultPromise = bindGlobalShortcutWithRetry("Control+Space", () => {}, {
+      retries: 3,
+      delayMs: 300,
+    })
+
+    await vi.advanceTimersByTimeAsync(300)
+    expect(globalShortcut.register).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(300)
+    expect(globalShortcut.register).toHaveBeenCalledTimes(3)
+
+    expect(await resultPromise).toBe(true)
+  })
+
+  it("gives up and returns false once retries are exhausted", async () => {
+    vi.useFakeTimers()
+    vi.mocked(globalShortcut.register).mockReturnValue(false)
+
+    const resultPromise = bindGlobalShortcutWithRetry("Control+Space", () => {}, {
+      retries: 2,
+      delayMs: 300,
+    })
+    await vi.advanceTimersByTimeAsync(300)
+    await vi.advanceTimersByTimeAsync(300)
+
+    expect(await resultPromise).toBe(false)
+    expect(globalShortcut.register).toHaveBeenCalledTimes(3)
   })
 })

@@ -174,6 +174,7 @@ import {
 import { settingsFilePath } from "./settings/settings"
 import {
   bindGlobalShortcut,
+  bindGlobalShortcutWithRetry,
   resumeGlobalShortcut,
   suspendGlobalShortcut,
   unbindGlobalShortcut,
@@ -1800,6 +1801,24 @@ function rebindHotkey(accelerator: string): boolean {
   return ok
 }
 
+/**
+ * Startup-only variant of {@link rebindHotkey}. Registration can fail
+ * transiently right after an electron-vite dev hot-restart — the previous
+ * process may still be tearing down (reaping plugin utilityProcess
+ * children) when the new process starts, so the OS briefly still reports
+ * the accelerator as owned by it. Retrying a few times clears this up
+ * without the user having to manually re-capture the hotkey. Runs
+ * fire-and-forget so a slow retry sequence never delays tray/window setup.
+ */
+async function rebindHotkeyAtStartup(accelerator: string): Promise<void> {
+  const ok = await bindGlobalShortcutWithRetry(accelerator, () =>
+    toggleSearchWindow(searchWindowDeps())
+  )
+  if (!ok) {
+    logger.child("synapse").warn("failed to register global shortcut", { accelerator })
+  }
+}
+
 function trayActions() {
   return {
     onOpenSearch: () => showSearchWindow(searchWindowDeps()),
@@ -2002,7 +2021,7 @@ if (isMcpStdioMode) {
       }
 
       createTray(defaultTrayIcon(), trayActions())
-      rebindHotkey(settings.hotkey)
+      void rebindHotkeyAtStartup(settings.hotkey)
       syncFloatingBallWindow(floatingBallDeps())
       showStartupNotification({
         hotkey: settings.hotkey,
