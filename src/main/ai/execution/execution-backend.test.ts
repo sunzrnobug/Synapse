@@ -44,18 +44,25 @@ describe("localPolicyBackendDescriptor — honest reality labels", () => {
 })
 
 describe("createLocalPolicyExecutionBackend", () => {
-  it("actually runs the command through the same runCommand path", async () => {
-    const root = await makeWorkspace()
-    const policy = new WorkspacePolicy([{ id: "repo", root }])
-    const backend = createLocalPolicyExecutionBackend()
-    const command = process.platform === "win32" ? "Write-Output ok" : "echo ok"
+  // Real powershell.exe spawn — see command-runner.test.ts for why this
+  // needs margin + retry above Vitest's 5s default on a loaded CI runner.
+  it(
+    "actually runs the command through the same runCommand path",
+    { timeout: 20_000, retry: 2 },
+    async () => {
+      const root = await makeWorkspace()
+      const policy = new WorkspacePolicy([{ id: "repo", root }])
+      const backend = createLocalPolicyExecutionBackend()
+      const command = process.platform === "win32" ? "Write-Output ok" : "echo ok"
 
-    const result = await backend.invoke({ invocationId: "inv-1", rootId: "repo", command }, policy)
-    expect(result.exitCode).toBe(0)
-    expect(result.legacyStdout).toContain("ok")
-    // Real powershell.exe spawn — see command-runner.test.ts for why this
-    // needs margin above Vitest's 5s default on a loaded CI runner.
-  }, 30_000)
+      const result = await backend.invoke(
+        { invocationId: "inv-1", rootId: "repo", command },
+        policy
+      )
+      expect(result.exitCode).toBe(0)
+      expect(result.legacyStdout).toContain("ok")
+    }
+  )
 
   it("always reports unknown for recoverInvocation — an invocation id alone proves nothing", async () => {
     const backend = createLocalPolicyExecutionBackend()

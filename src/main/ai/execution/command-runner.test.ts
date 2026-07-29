@@ -44,7 +44,19 @@ async function writeScript(dir: string, name: string, source: string): Promise<s
 }
 
 describe("runCommand — legacy in-memory path (no artifacts option)", () => {
-  it("runs a simple command with exit code 0", async () => {
+  // Real powershell.exe spawns. Vitest's default 5s test timeout has no
+  // margin for one, and CI load has been observed pushing a bare spawn past
+  // even a 15s/30s single-attempt window on a busy runner (a different
+  // real-process test trips this each time, never the same one twice —
+  // consistent with transient scheduling contention on a shared CI runner,
+  // not a deterministic hang). Worse than an ordinary flaky failure: when
+  // Vitest abandons a timed-out test it never kills the underlying child
+  // process, so the orphaned runCommand() keeps running and holds a
+  // Windows-exclusive file lock inside its temp workspace — corrupting
+  // every later test's fs.rm() cleanup with EBUSY/ENOTEMPTY. A retry (the
+  // standard mitigation for CI-load-sensitive real-process tests) is more
+  // robust here than an ever-larger single-attempt timeout.
+  it("runs a simple command with exit code 0", { timeout: 20_000, retry: 2 }, async () => {
     const root = await makeWorkspace()
     const policy = new WorkspacePolicy([{ id: "repo", root }])
     const command = process.platform === "win32" ? "Write-Output ok" : "echo ok"
@@ -52,23 +64,15 @@ describe("runCommand — legacy in-memory path (no artifacts option)", () => {
     expect(result.exitCode).toBe(0)
     expect(result.legacyStdout).toContain("ok")
     expect(result.stdout).toBeUndefined()
-    // A real powershell.exe spawn can occasionally exceed Vitest's 5s
-    // default on a loaded CI runner — observed exceeding even a 15s margin
-    // under heavy parallel CI load. Worse than a flaky failure: when Vitest
-    // abandons a timed-out test it never kills the underlying child
-    // process, so the orphaned runCommand() keeps running and holds a
-    // Windows-exclusive file lock inside its temp workspace — corrupting
-    // every later test's fs.rm() cleanup with EBUSY/ENOTEMPTY. 30s matches
-    // the rest of this file's real-process tests.
-  }, 30_000)
+  })
 
-  it("returns non-zero exit codes", async () => {
+  it("returns non-zero exit codes", { timeout: 20_000, retry: 2 }, async () => {
     const root = await makeWorkspace()
     const policy = new WorkspacePolicy([{ id: "repo", root }])
     const command = process.platform === "win32" ? "exit 3" : "exit 3"
     const result = await runCommand(policy, { rootId: "repo", command, timeoutMs: 5_000 })
     expect(result.exitCode).not.toBe(0)
-  }, 30_000)
+  })
 
   it("times out long-running commands", async () => {
     const root = await makeWorkspace()
@@ -99,60 +103,68 @@ describe("runCommand — legacy in-memory path (no artifacts option)", () => {
 })
 
 describe("runCommand — artifact-backed capture path", () => {
-  it("captures stdout as a durable, complete artifact with bounded head/tail previews", async () => {
-    const root = await makeWorkspace()
-    const policy = new WorkspacePolicy([{ id: "repo", root }])
-    const artifactsDir = await makeArtifactsDir()
-    const store = new ArtifactStore(artifactsDir, { statDiskSpace: ampleDisk })
-    const command = process.platform === "win32" ? "Write-Output ok" : "echo ok"
+  it(
+    "captures stdout as a durable, complete artifact with bounded head/tail previews",
+    { timeout: 20_000, retry: 2 },
+    async () => {
+      const root = await makeWorkspace()
+      const policy = new WorkspacePolicy([{ id: "repo", root }])
+      const artifactsDir = await makeArtifactsDir()
+      const store = new ArtifactStore(artifactsDir, { statDiskSpace: ampleDisk })
+      const command = process.platform === "win32" ? "Write-Output ok" : "echo ok"
 
-    const result = await runCommand(policy, {
-      rootId: "repo",
-      command,
-      artifacts: { store, owner: owner() },
-    })
+      const result = await runCommand(policy, {
+        rootId: "repo",
+        command,
+        artifacts: { store, owner: owner() },
+      })
 
-    expect(result.exitCode).toBe(0)
-    expect(result.legacyStdout).toBeUndefined()
-    expect(result.stdout?.artifact.complete).toBe(true)
-    expect(result.stdout?.artifact.truncationReason).toBeUndefined()
-    expect(result.stdout?.headPreview).toContain("ok")
-    expect(result.stdout?.tailPreview).toContain("ok")
-    expect(result.stdout?.artifact.uri).toBe(
-      `artifact://run/run-1/${result.stdout?.artifact.artifactId}`
-    )
-    expect(result.stderr?.artifact.complete).toBe(true)
-  }, 30_000)
+      expect(result.exitCode).toBe(0)
+      expect(result.legacyStdout).toBeUndefined()
+      expect(result.stdout?.artifact.complete).toBe(true)
+      expect(result.stdout?.artifact.truncationReason).toBeUndefined()
+      expect(result.stdout?.headPreview).toContain("ok")
+      expect(result.stdout?.tailPreview).toContain("ok")
+      expect(result.stdout?.artifact.uri).toBe(
+        `artifact://run/run-1/${result.stdout?.artifact.artifactId}`
+      )
+      expect(result.stderr?.artifact.complete).toBe(true)
+    }
+  )
 
-  it("captures output above the legacy preview cap but below artifact limits, and survives a store restart", async () => {
-    const root = await makeWorkspace()
-    const policy = new WorkspacePolicy([{ id: "repo", root }])
-    const artifactsDir = await makeArtifactsDir()
-    const store = new ArtifactStore(artifactsDir, { statDiskSpace: ampleDisk })
-    const size = 40_000 // > legacy 32,000-char cap, << the 64 MiB artifact ceiling
-    const command =
-      process.platform === "win32"
-        ? `Write-Output ('a' * ${size})`
-        : `node -e "process.stdout.write('a'.repeat(${size}))"`
+  it(
+    "captures output above the legacy preview cap but below artifact limits, and survives a store restart",
+    { timeout: 20_000, retry: 2 },
+    async () => {
+      const root = await makeWorkspace()
+      const policy = new WorkspacePolicy([{ id: "repo", root }])
+      const artifactsDir = await makeArtifactsDir()
+      const store = new ArtifactStore(artifactsDir, { statDiskSpace: ampleDisk })
+      const size = 40_000 // > legacy 32,000-char cap, << the 64 MiB artifact ceiling
+      const command =
+        process.platform === "win32"
+          ? `Write-Output ('a' * ${size})`
+          : `node -e "process.stdout.write('a'.repeat(${size}))"`
 
-    const result = await runCommand(policy, {
-      rootId: "repo",
-      command,
-      artifacts: { store, owner: owner() },
-    })
+      const result = await runCommand(policy, {
+        rootId: "repo",
+        command,
+        artifacts: { store, owner: owner() },
+      })
 
-    expect(result.stdout?.artifact.complete).toBe(true)
-    expect(result.stdout?.artifact.capturedBytes).toBeGreaterThanOrEqual(size)
+      expect(result.stdout?.artifact.complete).toBe(true)
+      expect(result.stdout?.artifact.capturedBytes).toBeGreaterThanOrEqual(size)
 
-    // Simulate a full process restart: a fresh ArtifactStore instance
-    // pointed at the same baseDir must still be able to read the complete
-    // artifact back, byte-for-byte and hash-for-hash.
-    const restarted = new ArtifactStore(artifactsDir, { statDiskSpace: ampleDisk })
-    const ref = result.stdout!.artifact
-    const bytes = await restarted.read(ref, { start: 0 }, { ...owner() })
-    expect(bytes.length).toBe(ref.capturedBytes)
-    expect(createHash("sha256").update(bytes).digest("hex")).toBe(ref.sha256)
-  }, 30_000)
+      // Simulate a full process restart: a fresh ArtifactStore instance
+      // pointed at the same baseDir must still be able to read the complete
+      // artifact back, byte-for-byte and hash-for-hash.
+      const restarted = new ArtifactStore(artifactsDir, { statDiskSpace: ampleDisk })
+      const ref = result.stdout!.artifact
+      const bytes = await restarted.read(ref, { start: 0 }, { ...owner() })
+      expect(bytes.length).toBe(ref.capturedBytes)
+      expect(createHash("sha256").update(bytes).digest("hex")).toBe(ref.sha256)
+    }
+  )
 
   it("kills the entire process tree when stdout exceeds its artifact quota, without deadlocking stderr's undrained pipe", async () => {
     const root = await makeWorkspace()
