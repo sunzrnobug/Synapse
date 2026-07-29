@@ -53,7 +53,9 @@ describe("createLocalPolicyExecutionBackend", () => {
     const result = await backend.invoke({ invocationId: "inv-1", rootId: "repo", command }, policy)
     expect(result.exitCode).toBe(0)
     expect(result.legacyStdout).toContain("ok")
-  })
+    // Real powershell.exe spawn — see command-runner.test.ts for why this
+    // needs margin above Vitest's 5s default on a loaded CI runner.
+  }, 15_000)
 
   it("always reports unknown for recoverInvocation — an invocation id alone proves nothing", async () => {
     const backend = createLocalPolicyExecutionBackend()

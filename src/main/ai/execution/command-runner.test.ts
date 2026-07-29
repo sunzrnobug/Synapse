@@ -52,7 +52,15 @@ describe("runCommand — legacy in-memory path (no artifacts option)", () => {
     expect(result.exitCode).toBe(0)
     expect(result.legacyStdout).toContain("ok")
     expect(result.stdout).toBeUndefined()
-  })
+    // A real powershell.exe spawn (see other tests in this file for the
+    // 15s convention) can occasionally exceed Vitest's 5s default on a
+    // loaded CI runner. Worse than a flaky failure: when Vitest abandons a
+    // timed-out test it never kills the underlying child process, so the
+    // orphaned runCommand() keeps running and holds a Windows-exclusive
+    // file lock inside its temp workspace — corrupting every later test's
+    // fs.rm() cleanup with EBUSY/ENOTEMPTY. Give this the same margin as
+    // the rest of the file so a slow runner can't trigger that cascade.
+  }, 15_000)
 
   it("returns non-zero exit codes", async () => {
     const root = await makeWorkspace()
@@ -60,7 +68,7 @@ describe("runCommand — legacy in-memory path (no artifacts option)", () => {
     const command = process.platform === "win32" ? "exit 3" : "exit 3"
     const result = await runCommand(policy, { rootId: "repo", command, timeoutMs: 5_000 })
     expect(result.exitCode).not.toBe(0)
-  })
+  }, 15_000)
 
   it("times out long-running commands", async () => {
     const root = await makeWorkspace()
@@ -114,7 +122,7 @@ describe("runCommand — artifact-backed capture path", () => {
       `artifact://run/run-1/${result.stdout?.artifact.artifactId}`
     )
     expect(result.stderr?.artifact.complete).toBe(true)
-  })
+  }, 15_000)
 
   it("captures output above the legacy preview cap but below artifact limits, and survives a store restart", async () => {
     const root = await makeWorkspace()
@@ -144,7 +152,7 @@ describe("runCommand — artifact-backed capture path", () => {
     const bytes = await restarted.read(ref, { start: 0 }, { ...owner() })
     expect(bytes.length).toBe(ref.capturedBytes)
     expect(createHash("sha256").update(bytes).digest("hex")).toBe(ref.sha256)
-  })
+  }, 15_000)
 
   it("kills the entire process tree when stdout exceeds its artifact quota, without deadlocking stderr's undrained pipe", async () => {
     const root = await makeWorkspace()
