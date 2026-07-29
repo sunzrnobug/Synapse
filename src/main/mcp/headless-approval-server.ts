@@ -1,6 +1,10 @@
 import type { Server, Socket } from "node:net"
 import type { ApprovalResult } from "../approvals/types"
-import type { CapabilityApprover, CapabilityRequest } from "../plugins/capability-gate"
+import type {
+  CapabilityApprover,
+  CapabilityRequest,
+  GrantPromptPort,
+} from "../plugins/capability-gate"
 import type { GrantIdentity } from "../plugins/grant-store"
 import type { HostResourceApprovalRequest, HostResourceApprover } from "./host-resource-approval"
 import { randomBytes } from "node:crypto"
@@ -31,6 +35,13 @@ const MAX_FIELD_LENGTH = 500
 export interface HeadlessApprovalServerOptions {
   approveCapability: CapabilityApprover
   approveHostResource: HostResourceApprover
+  /** First-time JIT capability grant decisions (see {@link GrantPromptPort}).
+   *  Required, not optional with an auto-allow default: `CapabilityGovernance`'s
+   *  own default (`capability-governance.ts`) auto-allows when no `prompt` is
+   *  supplied, which is the right fallback for early scaffolding but the wrong
+   *  one for a real transport — silently allowing every first-time grant
+   *  whenever no GUI is attached defeats "no silent auto-allow" outright. */
+  promptForGrant: GrantPromptPort
   portFilePath: string
   /** Time budget for one connection to send a complete request line.
    *  Defaults to 10s — generous for a same-machine round trip, short enough
@@ -96,10 +107,16 @@ async function handleConnection(
             identity: parsed.identity,
             request: { ...parsed.request, signal: connectionController.signal },
           })
-        : options.approveHostResource({
-            request: parsed.request,
-            signal: connectionController.signal,
-          })
+        : parsed.kind === "plugin-prompt"
+          ? options.promptForGrant({
+              identity: parsed.identity,
+              request: { ...parsed.request, signal: connectionController.signal },
+              tier: parsed.tier,
+            })
+          : options.approveHostResource({
+              request: parsed.request,
+              signal: connectionController.signal,
+            })
 
     const cancelWatchPromise = (async (): Promise<"cancel" | undefined> => {
       let line: unknown
@@ -156,6 +173,14 @@ type ParsedPayload =
     }
   | {
       token: string
+      kind: "plugin-prompt"
+      requestId: string
+      identity: GrantIdentity
+      request: CapabilityRequest
+      tier: string
+    }
+  | {
+      token: string
       kind: "host-resource"
       requestId: string
       request: HostResourceApprovalRequest
@@ -167,13 +192,16 @@ function parsePayload(value: unknown): ParsedPayload | undefined {
   if (typeof v.token !== "string") return undefined
   if (typeof v.requestId !== "string" || v.requestId.length === 0) return undefined
   if (v.kind === "plugin-capability") return parseCapabilityPayload(v)
+  if (v.kind === "plugin-prompt") return parsePromptPayload(v)
   if (v.kind === "host-resource") return parseHostResourcePayload(v)
   return undefined
 }
 
-function parseCapabilityPayload(
+/** Shared by plugin-capability and plugin-prompt — both carry a GrantIdentity
+ *  plus a CapabilityRequest; plugin-prompt additionally carries a tier. */
+function parseIdentityAndRequest(
   v: Record<string, unknown>
-): Extract<ParsedPayload, { kind: "plugin-capability" }> | undefined {
+): { identity: GrantIdentity; request: CapabilityRequest } | undefined {
   if (!v.identity || typeof v.identity !== "object") return undefined
   if (!v.request || typeof v.request !== "object") return undefined
   const request = v.request as Record<string, unknown>
@@ -190,11 +218,38 @@ function parseCapabilityPayload(
     return undefined
   }
   return {
+    identity: v.identity as GrantIdentity,
+    request: request as unknown as CapabilityRequest,
+  }
+}
+
+function parseCapabilityPayload(
+  v: Record<string, unknown>
+): Extract<ParsedPayload, { kind: "plugin-capability" }> | undefined {
+  const parsed = parseIdentityAndRequest(v)
+  if (!parsed) return undefined
+  return {
     token: v.token as string,
     kind: "plugin-capability",
     requestId: v.requestId as string,
-    identity: v.identity as GrantIdentity,
-    request: request as unknown as CapabilityRequest,
+    identity: parsed.identity,
+    request: parsed.request,
+  }
+}
+
+function parsePromptPayload(
+  v: Record<string, unknown>
+): Extract<ParsedPayload, { kind: "plugin-prompt" }> | undefined {
+  if (typeof v.tier !== "string" || v.tier.length === 0) return undefined
+  const parsed = parseIdentityAndRequest(v)
+  if (!parsed) return undefined
+  return {
+    token: v.token as string,
+    kind: "plugin-prompt",
+    requestId: v.requestId as string,
+    identity: parsed.identity,
+    request: parsed.request,
+    tier: v.tier,
   }
 }
 

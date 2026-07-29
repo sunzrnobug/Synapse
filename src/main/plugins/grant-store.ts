@@ -189,6 +189,26 @@ export class GrantStore {
   }
 
   /**
+   * Removes every grant and tombstone for this pluginId, across every
+   * identity (publisher, signing key, declaration hash) that has ever been
+   * recorded for it — not just the identity of whichever manifest is
+   * currently installed. Used on full uninstall: `revoke()`/`grant()` only
+   * ever touch ONE identity at a time, so a plugin that was granted
+   * capabilities under an older declaration hash (a previous version, or a
+   * dev-linked build) would otherwise keep those grants live forever —
+   * reinstalling (or downgrading to) that old version would silently
+   * restore them with no re-consent.
+   */
+  async purgeAllForPluginId(pluginId: string): Promise<void> {
+    return this.runExclusive(async () => {
+      const state = await this.load()
+      state.grants = state.grants.filter((r) => r.identity.pluginId !== pluginId)
+      state.tombstones = state.tombstones.filter((t) => t.identity.pluginId !== pluginId)
+      await this.persist(state)
+    })
+  }
+
+  /**
    * Install-time auto grant, blocked by a COARSE-identity tombstone so a user's
    * revoke survives a same-publisher plugin update (declaration-hash change).
    */

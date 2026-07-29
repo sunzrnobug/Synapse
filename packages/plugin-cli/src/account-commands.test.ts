@@ -141,6 +141,67 @@ describe("runWhoami", () => {
       runWhoami({ client, store: memoryStore({ [BASE]: "stale" }), baseUrl: BASE, io })
     ).rejects.toThrow(/session expired/i)
   })
+
+  it("prefers the SYNAPSE_TOKEN env var over the persisted store", async () => {
+    const originalEnv = process.env.SYNAPSE_TOKEN
+    process.env.SYNAPSE_TOKEN = "env-token"
+    try {
+      const io = makeIo()
+      const sessionCalls: string[] = []
+      const client = fakeClient({
+        session: async (token) => {
+          sessionCalls.push(token)
+          return { user: USER }
+        },
+      })
+      // A store that would throw if actually consulted — proves the env var
+      // short-circuits it rather than merely happening to agree with it.
+      const store: CredentialStore = {
+        get: async () => {
+          throw new Error("store.get should not be called when SYNAPSE_TOKEN is set")
+        },
+        set: async () => {},
+        clear: async () => {},
+      }
+      await runWhoami({ client, store, baseUrl: BASE, io })
+      expect(sessionCalls).toEqual(["env-token"])
+    } finally {
+      // Assigning `undefined` to a process.env key coerces it to the string
+      // "undefined" rather than deleting it — restore properly or this leaks
+      // a truthy SYNAPSE_TOKEN into every later test in this file.
+      if (originalEnv === undefined) delete process.env.SYNAPSE_TOKEN
+      else process.env.SYNAPSE_TOKEN = originalEnv
+    }
+  })
+
+  it("prefers an explicit deps.token (e.g. --token-stdin) over SYNAPSE_TOKEN and the store", async () => {
+    const originalEnv = process.env.SYNAPSE_TOKEN
+    process.env.SYNAPSE_TOKEN = "env-token"
+    try {
+      const io = makeIo()
+      const sessionCalls: string[] = []
+      const client = fakeClient({
+        session: async (token) => {
+          sessionCalls.push(token)
+          return { user: USER }
+        },
+      })
+      await runWhoami({
+        client,
+        store: memoryStore({ [BASE]: "stored-token" }),
+        baseUrl: BASE,
+        io,
+        token: "stdin-token",
+      })
+      expect(sessionCalls).toEqual(["stdin-token"])
+    } finally {
+      // Assigning `undefined` to a process.env key coerces it to the string
+      // "undefined" rather than deleting it — restore properly or this leaks
+      // a truthy SYNAPSE_TOKEN into every later test in this file.
+      if (originalEnv === undefined) delete process.env.SYNAPSE_TOKEN
+      else process.env.SYNAPSE_TOKEN = originalEnv
+    }
+  })
 })
 
 describe("runLogout", () => {

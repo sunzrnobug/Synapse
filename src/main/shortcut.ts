@@ -35,6 +35,27 @@ export function bindGlobalShortcut(accelerator: string, handler: () => void): bo
   return false
 }
 
+/**
+ * Same as {@link bindGlobalShortcut}, but retries on failure instead of
+ * giving up immediately. Registration can fail transiently right after an
+ * electron-vite dev hot-restart: the previous process's `will-quit` handler
+ * unregisters the accelerator, but if that process is still tearing down
+ * (e.g. reaping plugin utilityProcess children) when the new process starts,
+ * the OS may briefly still report the accelerator as owned by it.
+ */
+export async function bindGlobalShortcutWithRetry(
+  accelerator: string,
+  handler: () => void,
+  options: { retries?: number; delayMs?: number } = {}
+): Promise<boolean> {
+  const { retries = 3, delayMs = 300 } = options
+  for (let attempt = 0; ; attempt++) {
+    if (bindGlobalShortcut(accelerator, handler)) return true
+    if (attempt >= retries) return false
+    await new Promise((resolve) => setTimeout(resolve, delayMs))
+  }
+}
+
 export function unbindGlobalShortcut(): void {
   if (currentAccelerator) globalShortcut.unregister(currentAccelerator)
   currentAccelerator = null

@@ -96,6 +96,15 @@ jobs:
 
       # Code signing is OPTIONAL and DISABLED by default.
       # For production releases with signing, populate the env block below.
+      #
+      # SECURITY NOTE (known, evaluated residual risk — not an oversight):
+      # unsigned installers mean Windows SmartScreen and other OS-level
+      # publisher-identity checks cannot vouch for this binary, and there is
+      # no revocation path if a release were ever compromised in transit.
+      # This is a deliberate, tracked tradeoff pending a business decision on
+      # purchasing a code-signing certificate (EV/OV) — the mechanical steps
+      # to turn it on are already wired below and in package.json's
+      # `build.win` block; only the two secrets need to be populated.
       - name: Build Electron app
         # env:
         #   # Optional: Windows code signing

@@ -357,6 +357,39 @@ describe("defaultTransport — real server: headers deadline", () => {
       await server.close()
     }
   })
+
+  // A literal IP in the URL (127.0.0.1, as above) never exercises Node's own
+  // DNS-lookup machinery: net.isIP() short-circuits and the custom `lookup`
+  // on the Agent is never called. A real hostname (any name that isn't a
+  // literal IP — "localhost" works because the loopback cert's SAN already
+  // covers it) forces Node through lookupAndConnectMultiple, which invokes
+  // the Agent's `lookup` with `{ all: true }` and expects the all-addresses
+  // callback form. A `lookup` that always calls back with the single-address
+  // 3-arg form regardless of `options.all` breaks under that path.
+  it("connects when the URL host is a real hostname requiring DNS lookup, not a literal IP", async () => {
+    const server = await startTlsLoopbackServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/plain" })
+      res.end("hello")
+    })
+    try {
+      const controller = new AbortController()
+      const result = await defaultTransport({
+        url: new URL(`https://localhost:${server.port}/`),
+        method: "GET",
+        headers: {},
+        pinnedAddress: { address: "127.0.0.1", family: 4 },
+        signal: controller.signal,
+        timeoutMs: 30_000,
+        headersDeadlineMs: 5_000,
+        maxResponseBytes: 1024,
+        trustedCaPem: server.certPem,
+      })
+      expect(result.status).toBe(200)
+      expect(result.body.toString()).toBe("hello")
+    } finally {
+      await server.close()
+    }
+  })
 })
 
 // ---- Test doubles -----------------------------------------------------------

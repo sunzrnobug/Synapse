@@ -294,3 +294,79 @@ describe("createGuiApprovalPort — requestHostResourceApproval", () => {
     expect(spawnGui).not.toHaveBeenCalled()
   })
 })
+
+describe("createGuiApprovalPort — requestPrompt", () => {
+  it("resolves true when the GUI is already listening and answers true", async () => {
+    await startFakeGui(true)
+    const port = createGuiApprovalPort({ portFilePath, spawnGui: vi.fn() })
+    const result = await port.requestPrompt({
+      identity: identity(),
+      request: request(),
+      tier: "consent",
+    })
+    expect(result).toEqual({ allow: true })
+  })
+
+  it("resolves false when the GUI is already listening and answers false", async () => {
+    await startFakeGui(false)
+    const port = createGuiApprovalPort({ portFilePath, spawnGui: vi.fn() })
+    const result = await port.requestPrompt({
+      identity: identity(),
+      request: request(),
+      tier: "consent",
+    })
+    expect(result).toEqual({ allow: false })
+  })
+
+  it("sends the request over the wire as kind: plugin-prompt, carrying identity/request/tier", async () => {
+    const receivedLines: unknown[] = []
+    await startSilentFakeGui(receivedLines)
+    const resultPromise = createGuiApprovalPort({
+      portFilePath,
+      spawnGui: vi.fn(),
+      responseTimeoutMs: 200,
+    }).requestPrompt({ identity: identity(), request: request(), tier: "elevated" })
+
+    await vi.waitFor(() => expect(receivedLines).toHaveLength(1))
+    expect(receivedLines[0]).toMatchObject({
+      kind: "plugin-prompt",
+      identity: identity(),
+      request: request(),
+      tier: "elevated",
+    })
+
+    await resultPromise
+  })
+
+  it("fails closed when nothing ever starts listening before connectTimeoutMs", async () => {
+    const spawnGui = vi.fn()
+    const port = createGuiApprovalPort({
+      portFilePath,
+      spawnGui,
+      connectTimeoutMs: 300,
+      retryIntervalMs: 50,
+    })
+    const result = await port.requestPrompt({
+      identity: identity(),
+      request: request(),
+      tier: "consent",
+    })
+    expect(result).toEqual({ allow: false, outcomeReason: "send-failed" })
+    expect(spawnGui).toHaveBeenCalledOnce()
+  })
+
+  it("returns false immediately without connecting when signal is already aborted", async () => {
+    const spawnGui = vi.fn()
+    const port = createGuiApprovalPort({ portFilePath, spawnGui })
+    const controller = new AbortController()
+    controller.abort()
+    const result = await port.requestPrompt({
+      identity: identity(),
+      request: request(),
+      tier: "consent",
+      signal: controller.signal,
+    })
+    expect(result).toEqual({ allow: false, outcomeReason: "cancelled" })
+    expect(spawnGui).not.toHaveBeenCalled()
+  })
+})

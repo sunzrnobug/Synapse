@@ -377,7 +377,7 @@ OwnershipClaim / Collaborator  { pluginId, userId, role }  # 多人协作(后期
 
 - ✅ **R2 `StorageProvider` 实现**(@aws-sdk/client-s3 + 预签名)+ `createStorage` 工厂(按 R2\_\* env 切换,缺则 InMemory dev 兜底);index.ts 已接。**已对真实 R2 桶端到端验证**(put→presign→fetch→字节一致)。
 - ✅ **Neon 接通**:`db:migrate` 已对真实 Neon 建好 9 张表;真实 `.env` 启动服务 `/health` 返回 ok(对 Neon 跑通 `select 1`)。
-- ✅ **CLI**(`@synapse/plugin-cli`):`login`(device-flow:开浏览器→轮询→token 存 `~/.synapse/credentials.json` mode 0600)/ `logout` / `whoami` / `publish`(复用 `buildPlugin` → 算 sha256 → multipart 调 `POST /plugins`)。`MarketplaceClient`(可注入 fetch)+ 命令逻辑全部依赖注入,**12 条单测**(mock client + 临时目录 store)。
+- ✅ **CLI**(`@synapse/plugin-cli`):`login`(device-flow:开浏览器→轮询→token 交给系统 credential helper 持久化)/ `logout` / `whoami` / `publish`(复用 `buildPlugin` → 算 sha256 → multipart 调 `POST /plugins`)。token 解析顺序 `--token-stdin` > `SYNAPSE_TOKEN` > 已登录存储。**安全修复(2026-07-22)**:token 不再明文落盘——`~/.synapse/config.json` 只存非敏感元数据(`credentialId`),真正的密钥经 `credential-helper/`(macOS Keychain / Windows DPAPI / Linux `secret-tool`,零原生依赖)存取;所在平台没有可用 helper 时 `login` 直接失败,不降级明文。`MarketplaceClient`(可注入 fetch)+ 命令逻辑全部依赖注入,单测覆盖 account-commands + credentials-store + 三平台 credential-helper。
 - ✅ **GitHub 浏览器登录腿**:`/auth/device/start` 的 `verificationUri` 改为 GitHub 授权 URL(userCode 走 `state`);新增 `GET /auth/github/callback`(换 token→upsert 用户→approve 设备授权→返回成功 HTML)。
 - ✅ **真实端到端冒烟通过**(2026-06-05):`login`(浏览器 GitHub 授权,登录为 `sunzrnobug`)→ `publish --public`(样例 `com.synapsetest.hello@1.0.0`)→ `GET /plugins` 列出 → 详情含版本 + R2 packageUrl → `whoami` 角色升为 `developer` → 解析签名下载 URL → 从 R2 取回 689 字节,**sha256 与发布时一致**。**M2 完成。**
 

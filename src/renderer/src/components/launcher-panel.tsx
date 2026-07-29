@@ -36,6 +36,7 @@ import {
   searchPluginCommands,
   writeClipboardContent,
 } from "@/lib/electron"
+import { pluginAssetUrl } from "@/lib/plugin-asset-url"
 
 interface ActiveCommand {
   pluginId: string
@@ -439,6 +440,13 @@ function LauncherPluginItem({
 }) {
   return (
     <>
+      {item.icon && (
+        <img
+          src={pluginAssetUrl(item.pluginId, item.icon)}
+          alt=""
+          className="mr-2 size-4 shrink-0 rounded-sm object-contain"
+        />
+      )}
       <div className="flex flex-1 flex-col">
         <span className="text-sm">{localize(item.title, locale)}</span>
         {item.subtitle && (

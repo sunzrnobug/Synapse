@@ -7,6 +7,7 @@
 // validated on the client matches what the server parses.
 
 export {
+  actionOkResponseSchema,
   adminReportsResponseSchema,
   apiErrorSchema,
   createReviewRequestSchema,
@@ -32,6 +33,7 @@ export {
 } from "./api"
 
 export type {
+  ActionOkResponse,
   AdminReportsResponse,
   ApiError,
   CreateReviewRequest,

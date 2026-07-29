@@ -144,6 +144,18 @@ export const nativeTheme = {
   shouldUseDarkColors: false,
   on: vi.fn(),
 }
+export const utilityProcess = {
+  // Real production forking (Critical #1's plugin-process-host.ts) is never
+  // exercised in unit tests — every test injects its own fake
+  // `forkProcess`/`ChildProcessHandle` — this only needs to exist so the
+  // module-level `import { utilityProcess } from "electron"` resolves.
+  fork: vi.fn(() => ({
+    ...createEventTarget(),
+    postMessage: vi.fn(),
+    kill: vi.fn(() => true),
+    pid: 1,
+  })),
+}
 
 export default {
   contextBridge,
@@ -166,4 +178,5 @@ export default {
   clipboard,
   desktopCapturer,
   globalShortcut,
+  utilityProcess,
 }

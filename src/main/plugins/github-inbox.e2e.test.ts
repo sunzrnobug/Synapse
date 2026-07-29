@@ -17,6 +17,7 @@ import { AgentRunStore } from "../ai/runs/agent-run-store"
 import { modelToolName } from "../ai/tool-registry"
 import { createHeadlessHotkeyAdapter } from "./headless-trigger-adapters"
 import { PluginHost } from "./plugin-host"
+import { createInProcessPluginFork } from "./test-support/in-process-plugin-fork"
 
 let dir: string
 let hostForCleanup: PluginHost | undefined
@@ -134,6 +135,7 @@ describe("github inbox plugin", () => {
       fsWatchAdapter: noopFsWatchAdapter,
       hotkeyAdapter: createHeadlessHotkeyAdapter(),
       workspaceRoots: { listForWorkspace: async () => [] },
+      sandboxForkProcess: createInProcessPluginFork(),
       ...support,
       adapters: {
         clipboard: { read: async () => undefined, write: async () => {} },

@@ -136,6 +136,10 @@ export const yankRequestSchema = z
 /** A user-submitted abuse/quality report against a plugin. */
 export const reportRequestSchema = z.object({ reason: z.string().min(1).max(1000) }).strict()
 
+/** Uniform ack for action endpoints with no data to return: report a
+ *  plugin, admin remove/restore, resolve a report. */
+export const actionOkResponseSchema = z.object({ status: z.literal("ok") }).strict()
+
 // ── Admin moderation ──────────────────────────────────────────────────────────
 
 /** The admin review queue. */
@@ -206,6 +210,7 @@ export type PublishResponse = z.infer<typeof publishResponseSchema>
 export type SetVisibilityRequest = z.infer<typeof setVisibilityRequestSchema>
 export type YankRequest = z.infer<typeof yankRequestSchema>
 export type ReportRequest = z.infer<typeof reportRequestSchema>
+export type ActionOkResponse = z.infer<typeof actionOkResponseSchema>
 export type AdminReportsResponse = z.infer<typeof adminReportsResponseSchema>
 export type ResolveReportRequest = z.infer<typeof resolveReportRequestSchema>
 export type ResolveDownloadResponse = z.infer<typeof resolveDownloadResponseSchema>

@@ -18,8 +18,20 @@ export interface GuiApprovalRequest {
   signal?: AbortSignal
 }
 
+export interface GuiPromptRequest {
+  identity: GrantIdentity
+  request: Omit<CapabilityRequest, "signal">
+  /** First-time-grant tier ("consent" | "elevated"), surfaced to the GUI
+   *  prompt dialog. */
+  tier: string
+  /** Local to this process only — never serialized. Same role as
+   *  {@link GuiApprovalRequest.signal}. */
+  signal?: AbortSignal
+}
+
 export interface GuiApprovalPort {
   requestApproval: (input: GuiApprovalRequest) => Promise<ApprovalResult>
+  requestPrompt: (input: GuiPromptRequest) => Promise<ApprovalResult>
   requestHostResourceApproval: (input: {
     request: HostResourceApprovalRequest
     /** Local to this process only — never serialized. Watched to decide
@@ -61,6 +73,17 @@ export function createGuiApprovalPort(options: GuiApprovalClientOptions): GuiApp
         options,
         input.signal
       ),
+    requestPrompt: (input) =>
+      sendPayload(
+        {
+          kind: "plugin-prompt",
+          identity: input.identity,
+          request: input.request,
+          tier: input.tier,
+        },
+        options,
+        input.signal
+      ),
     requestHostResourceApproval: (input) =>
       sendPayload({ kind: "host-resource", request: input.request }, options, input.signal),
   }
@@ -71,6 +94,12 @@ type OutgoingPayload =
       kind: "plugin-capability"
       identity: GrantIdentity
       request: Omit<CapabilityRequest, "signal">
+    }
+  | {
+      kind: "plugin-prompt"
+      identity: GrantIdentity
+      request: Omit<CapabilityRequest, "signal">
+      tier: string
     }
   | { kind: "host-resource"; request: HostResourceApprovalRequest }
 

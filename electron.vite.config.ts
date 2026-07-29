@@ -35,8 +35,19 @@ export default defineConfig({
     // is aliased to source for tsc/vitest. zod stays externalized (real dep).
     // @synapse/agent-protocol has no runtime dependency of its own (pure
     // types + pure functions), so it is always safe to bundle from source.
+    // @synapse/marketplace-types is the same story as plugin-manifest (zod
+    // schemas marketplace-api.ts parses responses with at runtime) — and,
+    // unlike the other three, isn't even a declared root dependency, so it
+    // has no real node_modules entry at all; this alias is the only thing
+    // that makes the import specifier below resolve, in dev or in a build.
     plugins: [
-      externalizeDepsPlugin({ exclude: ["@synapse/plugin-manifest", "@synapse/agent-protocol"] }),
+      externalizeDepsPlugin({
+        exclude: [
+          "@synapse/plugin-manifest",
+          "@synapse/agent-protocol",
+          "@synapse/marketplace-types",
+        ],
+      }),
       copyCredentialSecretPromptHtml(),
     ],
     resolve: {
@@ -44,6 +55,7 @@ export default defineConfig({
         "@synapse/plugin-manifest": resolve(__dirname, "packages/plugin-manifest/src/index.ts"),
         "@synapse/plugin-sdk": resolve(__dirname, "packages/plugin-sdk/src/index.ts"),
         "@synapse/agent-protocol": resolve(__dirname, "packages/agent-protocol/src/index.ts"),
+        "@synapse/marketplace-types": resolve(__dirname, "packages/marketplace-types/src/index.ts"),
       },
     },
     build: {
@@ -52,9 +64,17 @@ export default defineConfig({
         // Synapse-as-MCP-server. The latter is launched with
         // ELECTRON_RUN_AS_NODE=1 so it actually receives piped stdin (a spawned
         // Electron GUI process on Windows does not) — see src/main/mcp/stdio-entry.ts.
+        // `plugin-runtime-entry` is loaded via `utilityProcess.fork()` (Critical
+        // #1 sandbox migration) — one child process per loaded plugin. Referenced
+        // as a sibling build output (`__dirname`-relative, same pattern as the
+        // `mcp-stdio.js` reference above) — computed by each real main-process
+        // entry itself (src/main/index.ts, src/main/mcp/stdio-entry.ts) and
+        // passed down, since plugin-sandbox.ts's own `__dirname` is unreliable
+        // once it's bundled into a chunk shared across multiple entries.
         input: {
           index: resolve(__dirname, "src/main/index.ts"),
           "mcp-stdio": resolve(__dirname, "src/main/mcp/stdio-entry.ts"),
+          "plugin-runtime-entry": resolve(__dirname, "src/main/plugins/plugin-runtime-entry.ts"),
         },
       },
     },

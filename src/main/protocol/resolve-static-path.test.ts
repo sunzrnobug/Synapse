@@ -1,6 +1,12 @@
+import { promises as fs } from "node:fs"
+import * as os from "node:os"
 import * as path from "node:path"
-import { describe, expect, it } from "vitest"
-import { getContentType, resolveStaticPath } from "./resolve-static-path"
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest"
+import {
+  getContentType,
+  resolveSafePluginAssetPath,
+  resolveStaticPath,
+} from "./resolve-static-path"
 
 const ROOT = path.resolve("/app/out/renderer")
 
@@ -71,5 +77,84 @@ describe("getContentType", () => {
 
   it("matches the extension case-insensitively", () => {
     expect(getContentType("PHOTO.JPEG")).toBe("image/jpeg")
+  })
+})
+
+describe("resolveSafePluginAssetPath", () => {
+  let root: string
+  let outside: string
+  // Not every environment can create symlinks (e.g. Windows without
+  // Developer Mode or admin rights) — probed once so the affected tests can
+  // skip cleanly rather than fail on an environment limitation unrelated to
+  // the behavior under test.
+  let symlinksSupported = false
+
+  beforeAll(async () => {
+    const probeDir = await fs.mkdtemp(path.join(os.tmpdir(), "syn-symlink-probe-"))
+    try {
+      await fs.writeFile(path.join(probeDir, "target"), "x")
+      await fs.symlink(path.join(probeDir, "target"), path.join(probeDir, "link"))
+      symlinksSupported = true
+    } catch {
+      symlinksSupported = false
+    } finally {
+      await fs.rm(probeDir, { recursive: true, force: true })
+    }
+  })
+
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "syn-asset-root-"))
+    outside = await fs.mkdtemp(path.join(os.tmpdir(), "syn-asset-outside-"))
+  })
+
+  afterEach(async () => {
+    await fs.rm(root, { recursive: true, force: true })
+    await fs.rm(outside, { recursive: true, force: true })
+  })
+
+  it("resolves a real image file inside root", async () => {
+    await fs.writeFile(path.join(root, "icon.png"), "fake-png-bytes")
+    const result = await resolveSafePluginAssetPath("/icon.png", root)
+    expect(result.kind).toBe("ok")
+  })
+
+  it("rejects a path with a non-image extension, even though it's otherwise a safe file inside root", async () => {
+    await fs.writeFile(path.join(root, "notes.txt"), "hello")
+    const result = await resolveSafePluginAssetPath("/notes.txt", root)
+    expect(result).toEqual({ kind: "forbidden" })
+  })
+
+  it("rejects parent-directory traversal (delegates to resolveStaticPath's lexical check)", async () => {
+    const result = await resolveSafePluginAssetPath("/../etc/passwd.png", root)
+    expect(result).toEqual({ kind: "forbidden" })
+  })
+
+  it("rejects a path that doesn't exist", async () => {
+    const result = await resolveSafePluginAssetPath("/missing.png", root)
+    expect(result).toEqual({ kind: "forbidden" })
+  })
+
+  it("rejects a directory named like an image file", async () => {
+    await fs.mkdir(path.join(root, "icon.png"))
+    const result = await resolveSafePluginAssetPath("/icon.png", root)
+    expect(result).toEqual({ kind: "forbidden" })
+  })
+
+  it("rejects a symlink whose target escapes root — the actual vulnerability this function closes", async () => {
+    if (!symlinksSupported) return
+    await fs.writeFile(path.join(outside, "secret.png"), "outside-bytes")
+    await fs.symlink(path.join(outside, "secret.png"), path.join(root, "icon.png"))
+
+    const result = await resolveSafePluginAssetPath("/icon.png", root)
+    expect(result).toEqual({ kind: "forbidden" })
+  })
+
+  it("accepts a symlink whose target is safely inside root", async () => {
+    if (!symlinksSupported) return
+    await fs.writeFile(path.join(root, "real-icon.png"), "real-bytes")
+    await fs.symlink(path.join(root, "real-icon.png"), path.join(root, "icon.png"))
+
+    const result = await resolveSafePluginAssetPath("/icon.png", root)
+    expect(result.kind).toBe("ok")
   })
 })

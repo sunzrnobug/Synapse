@@ -81,6 +81,7 @@ describe("startHeadlessApprovalServer", () => {
     const handle = await startHeadlessApprovalServer({
       approveCapability,
       approveHostResource,
+      promptForGrant: vi.fn(async () => ({ allow: true as const })),
       portFilePath,
     })
     try {
@@ -106,12 +107,75 @@ describe("startHeadlessApprovalServer", () => {
     }
   })
 
+  it("forwards a plugin-prompt request to promptForGrant and returns its answer", async () => {
+    const approveCapability = vi.fn(async () => ({ allow: true as const }))
+    const promptForGrant = vi.fn(async () => ({ allow: true as const }))
+    const handle = await startHeadlessApprovalServer({
+      approveCapability,
+      approveHostResource: vi.fn(async () => ({ allow: true as const })),
+      promptForGrant,
+      portFilePath,
+    })
+    try {
+      const { port, token } = await readEndpoint()
+      const socket = await connectSocket(port)
+      writeJsonLine(socket, {
+        token,
+        requestId: "req-prompt-1",
+        kind: "plugin-prompt",
+        identity: identity(),
+        request: capabilityRequest(),
+        tier: "consent",
+      })
+      const response = await readJsonLine(socket, 2000)
+      expect(response).toEqual({ allow: true })
+      expect(promptForGrant).toHaveBeenCalledWith({
+        identity: identity(),
+        request: { ...capabilityRequest(), signal: expect.any(AbortSignal) },
+        tier: "consent",
+      })
+      expect(approveCapability).not.toHaveBeenCalled()
+      socket.end()
+    } finally {
+      await handle.close()
+    }
+  })
+
+  it("responds allow:false for a malformed plugin-prompt payload (missing tier)", async () => {
+    const promptForGrant = vi.fn(async () => ({ allow: true as const }))
+    const handle = await startHeadlessApprovalServer({
+      approveCapability: vi.fn(async () => ({ allow: true as const })),
+      approveHostResource: vi.fn(async () => ({ allow: true as const })),
+      promptForGrant,
+      portFilePath,
+    })
+    try {
+      const { port, token } = await readEndpoint()
+      const socket = await connectSocket(port)
+      writeJsonLine(socket, {
+        token,
+        requestId: "req-prompt-malformed",
+        kind: "plugin-prompt",
+        identity: identity(),
+        request: capabilityRequest(),
+        /* missing tier */
+      })
+      const response = (await readJsonLine(socket, 2000)) as { allow: boolean }
+      expect(response.allow).toBe(false)
+      expect(promptForGrant).not.toHaveBeenCalled()
+      socket.end()
+    } finally {
+      await handle.close()
+    }
+  })
+
   it("forwards a host-resource request to approveHostResource and returns its answer", async () => {
     const approveCapability = vi.fn(async () => ({ allow: true as const }))
     const approveHostResource = vi.fn(async () => ({ allow: true as const }))
     const handle = await startHeadlessApprovalServer({
       approveCapability,
       approveHostResource,
+      promptForGrant: vi.fn(async () => ({ allow: true as const })),
       portFilePath,
     })
     try {
@@ -142,6 +206,7 @@ describe("startHeadlessApprovalServer", () => {
     const handle = await startHeadlessApprovalServer({
       approveCapability,
       approveHostResource,
+      promptForGrant: vi.fn(async () => ({ allow: true as const })),
       portFilePath,
     })
     try {
@@ -169,6 +234,7 @@ describe("startHeadlessApprovalServer", () => {
     const handle = await startHeadlessApprovalServer({
       approveCapability,
       approveHostResource: vi.fn(async () => ({ allow: true as const })),
+      promptForGrant: vi.fn(async () => ({ allow: true as const })),
       portFilePath,
     })
     try {
@@ -194,6 +260,7 @@ describe("startHeadlessApprovalServer", () => {
     const handle = await startHeadlessApprovalServer({
       approveCapability: vi.fn(async () => ({ allow: true as const })),
       approveHostResource,
+      promptForGrant: vi.fn(async () => ({ allow: true as const })),
       portFilePath,
     })
     try {
@@ -221,6 +288,7 @@ describe("startHeadlessApprovalServer", () => {
     const handle = await startHeadlessApprovalServer({
       approveCapability: vi.fn(async () => ({ allow: true as const })),
       approveHostResource: vi.fn(async () => ({ allow: true as const })),
+      promptForGrant: vi.fn(async () => ({ allow: true as const })),
       portFilePath,
     })
     try {
@@ -245,6 +313,7 @@ describe("startHeadlessApprovalServer", () => {
     const handle = await startHeadlessApprovalServer({
       approveCapability: vi.fn(async () => ({ allow: true as const })),
       approveHostResource,
+      promptForGrant: vi.fn(async () => ({ allow: true as const })),
       portFilePath,
     })
     try {
@@ -269,6 +338,7 @@ describe("startHeadlessApprovalServer", () => {
     const handle = await startHeadlessApprovalServer({
       approveCapability: async () => ({ allow: true as const }),
       approveHostResource: async () => ({ allow: true as const }),
+      promptForGrant: vi.fn(async () => ({ allow: true as const })),
       portFilePath,
     })
     const { port } = await readEndpoint()
@@ -295,6 +365,7 @@ describe("cancel frame", () => {
     const handle = await startHeadlessApprovalServer({
       approveCapability,
       approveHostResource: vi.fn(async () => ({ allow: true as const })),
+      promptForGrant: vi.fn(async () => ({ allow: true as const })),
       portFilePath,
     })
     try {
@@ -325,6 +396,7 @@ describe("cancel frame", () => {
     const handle = await startHeadlessApprovalServer({
       approveCapability: async () => ({ allow: true as const }),
       approveHostResource: vi.fn(async () => ({ allow: true as const })),
+      promptForGrant: vi.fn(async () => ({ allow: true as const })),
       portFilePath,
     })
     try {
@@ -355,6 +427,7 @@ describe("cancel frame", () => {
     const handle = await startHeadlessApprovalServer({
       approveCapability,
       approveHostResource: vi.fn(async () => ({ allow: true as const })),
+      promptForGrant: vi.fn(async () => ({ allow: true as const })),
       portFilePath,
     })
     try {
@@ -390,6 +463,7 @@ describe("cancel frame", () => {
     const handle = await startHeadlessApprovalServer({
       approveCapability,
       approveHostResource: vi.fn(async () => ({ allow: true as const })),
+      promptForGrant: vi.fn(async () => ({ allow: true as const })),
       portFilePath,
     })
     try {
@@ -426,6 +500,7 @@ describe("cancel frame", () => {
     const handle = await startHeadlessApprovalServer({
       approveCapability,
       approveHostResource: vi.fn(async () => ({ allow: true as const })),
+      promptForGrant: vi.fn(async () => ({ allow: true as const })),
       portFilePath,
     })
     try {

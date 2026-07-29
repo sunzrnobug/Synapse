@@ -43,6 +43,44 @@ describe("grantStore", () => {
     expect(await new GrantStore(file).isGranted(identity(), "clipboard:read")).toBe(true)
   })
 
+  it("purgeAllForPluginId removes every grant for that pluginId across every identity (old and new declaration hashes)", async () => {
+    const store = new GrantStore(file)
+    const oldIdentity = identity({ capabilityDeclarationHash: "old-hash" })
+    const newIdentity = identity({ capabilityDeclarationHash: "new-hash" })
+    await store.grant(oldIdentity, "clipboard:read", "user")
+    await store.grant(newIdentity, "storage:plugin", "user")
+
+    await store.purgeAllForPluginId(oldIdentity.pluginId)
+
+    expect(await store.isGranted(oldIdentity, "clipboard:read")).toBe(false)
+    expect(await store.isGranted(newIdentity, "storage:plugin")).toBe(false)
+  })
+
+  it("purgeAllForPluginId also clears tombstones, so a reinstall isn't blocked by a stale revoke", async () => {
+    const store = new GrantStore(file)
+    await store.grant(identity(), "clipboard:read", "user")
+    await store.revoke(identity(), "clipboard:read", "user")
+
+    await store.purgeAllForPluginId(identity().pluginId)
+
+    // If the tombstone survived the purge, grantAutoIfAllowed would still be
+    // coarse-blocked and this would remain false.
+    await store.grantAutoIfAllowed(identity(), "clipboard:read")
+    expect(await store.isGranted(identity(), "clipboard:read")).toBe(true)
+  })
+
+  it("purgeAllForPluginId does not affect grants for a different pluginId", async () => {
+    const store = new GrantStore(file)
+    const other = identity({ pluginId: "com.example.other" })
+    await store.grant(identity(), "clipboard:read", "user")
+    await store.grant(other, "clipboard:read", "user")
+
+    await store.purgeAllForPluginId(identity().pluginId)
+
+    expect(await store.isGranted(identity(), "clipboard:read")).toBe(false)
+    expect(await store.isGranted(other, "clipboard:read")).toBe(true)
+  })
+
   it("lists a plugin's grants with grantedBy recorded", async () => {
     const store = new GrantStore(file, () => 42)
     await store.grant(identity(), "clipboard:read", "install")

@@ -1,3 +1,4 @@
+import { promises as fs } from "node:fs"
 import * as path from "node:path"
 
 export type ResolveResult = { kind: "ok"; filePath: string } | { kind: "forbidden" }
@@ -31,6 +32,61 @@ export function resolveStaticPath(rawPathname: string, root: string): ResolveRes
   }
 
   return { kind: "ok", filePath }
+}
+
+const IMAGE_EXTENSIONS = new Set([
+  ".svg",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".avif",
+  ".ico",
+])
+
+/**
+ * Like {@link resolveStaticPath}, plus two checks needed only for serving
+ * untrusted third-party content (a plugin's declared icon), not our own
+ * build output: `resolveStaticPath`'s traversal check is purely lexical, so
+ * a plugin package that ships a symlink whose target escapes its own
+ * install directory would otherwise be served as if it were a normal file
+ * (CWE-59) — this resolves symlinks via `fs.realpath` and re-checks the
+ * resolved target still lives under `root`. It also restricts the result
+ * to a regular file with a known image extension, since this path only
+ * ever needs to serve an icon.
+ */
+export async function resolveSafePluginAssetPath(
+  rawPathname: string,
+  root: string
+): Promise<ResolveResult> {
+  const lexical = resolveStaticPath(rawPathname, root)
+  if (lexical.kind === "forbidden") return lexical
+
+  if (!IMAGE_EXTENSIONS.has(path.extname(lexical.filePath).toLowerCase())) {
+    return { kind: "forbidden" }
+  }
+
+  let realFilePath: string
+  let realRoot: string
+  try {
+    ;[realFilePath, realRoot] = await Promise.all([
+      fs.realpath(lexical.filePath),
+      fs.realpath(root),
+    ])
+  } catch {
+    return { kind: "forbidden" }
+  }
+
+  const realRootWithSep = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep
+  if (realFilePath !== realRoot && !realFilePath.startsWith(realRootWithSep)) {
+    return { kind: "forbidden" }
+  }
+
+  const stat = await fs.stat(realFilePath).catch(() => undefined)
+  if (!stat?.isFile()) return { kind: "forbidden" }
+
+  return { kind: "ok", filePath: realFilePath }
 }
 
 const CONTENT_TYPES: Record<string, string> = {

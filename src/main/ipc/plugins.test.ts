@@ -6,7 +6,7 @@ import { MarketplaceApiError } from "../plugins/marketplace-api"
 import { PermissionDenied } from "../plugins/permissions"
 import { PluginHostNotImplementedError, PluginInstallError } from "../plugins/plugin-host"
 import { PluginCrashedError } from "../plugins/plugin-registry"
-import { PluginInvocationTimeoutError } from "../plugins/plugin-sandbox"
+import { PluginCallCancelledError, PluginInvocationTimeoutError } from "../plugins/plugin-sandbox"
 import { createPluginIpcHandlers, invokePluginIpcHandler } from "./plugins"
 
 function fakeHost(overrides: Partial<PluginHost> = {}): PluginHost {
@@ -335,6 +335,29 @@ describe("plugin ipc handlers", () => {
       error: {
         code: "PLUGIN_CRASHED",
         message: "Plugin crashed.",
+        details: { pluginId: "com.synapse.test" },
+      },
+    })
+  })
+
+  it("maps PluginCallCancelledError to PLUGIN_CALL_CANCELLED with pluginId", async () => {
+    const result = await invokePluginIpcHandler(
+      "plugin:invoke",
+      fakeEvent("app://app/index.html"),
+      () => {
+        throw new PluginCallCancelledError(
+          "com.synapse.test",
+          "Plugin call was cancelled: capability revoked for com.synapse.test"
+        )
+      },
+      () => true
+    )
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: "PLUGIN_CALL_CANCELLED",
+        message: "Plugin call was cancelled.",
         details: { pluginId: "com.synapse.test" },
       },
     })

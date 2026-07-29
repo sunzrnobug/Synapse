@@ -11,7 +11,20 @@ import type {
   SessionResponse,
   Visibility,
 } from "@synapse/marketplace-types"
+import type { z } from "zod"
 import process from "node:process"
+import {
+  actionOkResponseSchema,
+  adminReportsResponseSchema,
+  deviceCodePollResponseSchema,
+  deviceCodeStartResponseSchema,
+  myPluginsResponseSchema,
+  pluginDetailResponseSchema,
+  rateResponseSchema,
+  resolveDownloadResponseSchema,
+  searchPluginsResponseSchema,
+  sessionResponseSchema,
+} from "@synapse/marketplace-types"
 
 // Client for the Synapse marketplace backend (the authoritative source).
 // The desktop app browses plugins, resolves signed download URLs, and — when
@@ -74,7 +87,7 @@ export function createMarketplaceApi(options: MarketplaceApiOptions = {}): Marke
     return token ? { authorization: `Bearer ${token}` } : {}
   }
 
-  async function handle<T>(response: Response): Promise<T> {
+  async function handle<T>(response: Response, schema?: z.ZodType<T>): Promise<T> {
     if (!response.ok) {
       let code = "http_error"
       let message = `Marketplace request failed (${response.status})`
@@ -87,23 +100,38 @@ export function createMarketplaceApi(options: MarketplaceApiOptions = {}): Marke
       }
       throw new MarketplaceApiError(response.status, code, message)
     }
-    return (await response.json()) as T
+    const json: unknown = await response.json()
+    if (!schema) return json as T
+    const result = schema.safeParse(json)
+    if (!result.success) {
+      throw new MarketplaceApiError(
+        response.status,
+        "invalid_response",
+        `Marketplace returned an unexpected response shape: ${result.error.message}`
+      )
+    }
+    return result.data
   }
 
-  async function get<T>(path: string): Promise<T> {
+  async function get<T>(path: string, schema?: z.ZodType<T>): Promise<T> {
     const headers = await authHeader()
     try {
       const response =
         Object.keys(headers).length > 0
           ? await doFetch(`${base}${path}`, { headers })
           : await doFetch(`${base}${path}`)
-      return await handle<T>(response)
+      return await handle<T>(response, schema)
     } catch (err) {
       throw asApiError(err)
     }
   }
 
-  async function send<T>(path: string, method: string, body: unknown): Promise<T> {
+  async function send<T>(
+    path: string,
+    method: string,
+    body: unknown,
+    schema?: z.ZodType<T>
+  ): Promise<T> {
     const headers = { "content-type": "application/json", ...(await authHeader()) }
     try {
       const response = await doFetch(`${base}${path}`, {
@@ -111,7 +139,7 @@ export function createMarketplaceApi(options: MarketplaceApiOptions = {}): Marke
         headers,
         body: JSON.stringify(body),
       })
-      return await handle<T>(response)
+      return await handle<T>(response, schema)
     } catch (err) {
       throw asApiError(err)
     }
@@ -120,65 +148,88 @@ export function createMarketplaceApi(options: MarketplaceApiOptions = {}): Marke
   return {
     search(query?: string) {
       const suffix = query && query.trim() ? `?q=${encodeURIComponent(query.trim())}` : ""
-      return get<SearchPluginsResponse>(`/plugins${suffix}`)
+      return get(`/plugins${suffix}`, searchPluginsResponseSchema)
     },
     detail(pluginId: string) {
-      return get<PluginDetailResponse>(`/plugins/${encodeURIComponent(pluginId)}`)
+      return get(`/plugins/${encodeURIComponent(pluginId)}`, pluginDetailResponseSchema)
     },
     resolveDownload(pluginId: string, version: string) {
-      return get<ResolveDownloadResponse>(
-        `/plugins/${encodeURIComponent(pluginId)}/versions/${encodeURIComponent(version)}/download`
+      return get(
+        `/plugins/${encodeURIComponent(pluginId)}/versions/${encodeURIComponent(version)}/download`,
+        resolveDownloadResponseSchema
       )
     },
     rate(pluginId: string, stars: number) {
-      return send<RateResponse>(`/plugins/${encodeURIComponent(pluginId)}/rating`, "PUT", { stars })
+      return send(
+        `/plugins/${encodeURIComponent(pluginId)}/rating`,
+        "PUT",
+        { stars },
+        rateResponseSchema
+      )
     },
     myPlugins() {
-      return get<MyPluginsResponse>("/plugins/mine")
+      return get("/plugins/mine", myPluginsResponseSchema)
     },
     setVisibility(pluginId: string, visibility: Visibility) {
-      return send<PluginDetailResponse>(
+      return send(
         `/plugins/${encodeURIComponent(pluginId)}/visibility`,
         "PATCH",
-        { visibility }
+        { visibility },
+        pluginDetailResponseSchema
       )
     },
     yank(pluginId: string, version: string, reason?: string) {
-      return send<PluginDetailResponse>(`/plugins/${encodeURIComponent(pluginId)}/yank`, "POST", {
-        version,
-        ...(reason ? { reason } : {}),
-      })
+      return send(
+        `/plugins/${encodeURIComponent(pluginId)}/yank`,
+        "POST",
+        { version, ...(reason ? { reason } : {}) },
+        pluginDetailResponseSchema
+      )
     },
     async report(pluginId: string, reason: string) {
-      await send<{ status: string }>(`/plugins/${encodeURIComponent(pluginId)}/report`, "POST", {
-        reason,
-      })
+      await send(
+        `/plugins/${encodeURIComponent(pluginId)}/report`,
+        "POST",
+        { reason },
+        actionOkResponseSchema
+      )
     },
     async adminRemove(pluginId: string) {
-      await send<{ status: string }>(`/plugins/${encodeURIComponent(pluginId)}/remove`, "POST", {})
+      await send(
+        `/plugins/${encodeURIComponent(pluginId)}/remove`,
+        "POST",
+        {},
+        actionOkResponseSchema
+      )
     },
     async adminRestore(pluginId: string) {
-      await send<{ status: string }>(`/plugins/${encodeURIComponent(pluginId)}/restore`, "POST", {})
+      await send(
+        `/plugins/${encodeURIComponent(pluginId)}/restore`,
+        "POST",
+        {},
+        actionOkResponseSchema
+      )
     },
     adminReports(status?: ReportStatus) {
       const suffix = status ? `?status=${encodeURIComponent(status)}` : ""
-      return get<AdminReportsResponse>(`/admin/reports${suffix}`)
+      return get(`/admin/reports${suffix}`, adminReportsResponseSchema)
     },
     async resolveReport(reportId: string, status: "reviewed" | "dismissed") {
-      await send<{ status: string }>(
+      await send(
         `/admin/reports/${encodeURIComponent(reportId)}/resolve`,
         "POST",
-        { status }
+        { status },
+        actionOkResponseSchema
       )
     },
     session() {
-      return get<SessionResponse>("/session")
+      return get("/session", sessionResponseSchema)
     },
     deviceStart() {
-      return send<DeviceCodeStartResponse>("/auth/device/start", "POST", {})
+      return send("/auth/device/start", "POST", {}, deviceCodeStartResponseSchema)
     },
     devicePoll(deviceCode: string) {
-      return send<DeviceCodePollResponse>("/auth/device/poll", "POST", { deviceCode })
+      return send("/auth/device/poll", "POST", { deviceCode }, deviceCodePollResponseSchema)
     },
   }
 }

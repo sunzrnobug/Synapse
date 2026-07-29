@@ -28,7 +28,19 @@ export const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/)
 /** ISO-8601 timestamp string (UTC). Transport-friendly; DBs store as timestamptz. */
 export const timestampSchema = z.iso.datetime()
 
-/** An https URL — the marketplace never serves plugin payloads over plaintext. */
+/** An https URL — the marketplace never serves plugin payloads over plaintext.
+ *
+ *  This previously also rejected a set of "shell metacharacters" as defense
+ *  in depth for a `verificationUri`-shaped value flowing into an OS
+ *  "open in browser" call downstream (plugin-cli's `openBrowser`). That
+ *  rejection was removed: `&` is the standard query-parameter separator
+ *  (`URLSearchParams.toString()` joins with it) and broke device-code login
+ *  outright when it was in the rejected set; `;` is a legal URL sub-delimiter
+ *  per RFC 3986 and can appear in a real query string. Chasing which
+ *  characters are "safe" to block here doesn't add real protection anyway —
+ *  `openBrowser` uses the `open` package, which never spawns a shell around
+ *  the url (see plugin-cli's cli.test.ts), so there is no injection vector
+ *  downstream left for this schema to defend against. */
 export const httpsUrlSchema = z.string().url().startsWith("https://")
 
 /**

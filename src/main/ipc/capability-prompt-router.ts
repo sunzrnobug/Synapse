@@ -24,16 +24,24 @@ export async function withCapabilityPromptTarget<T>(
   }
 }
 
+/** Minimal window shape `deliverPrompt` needs — matches `BrowserWindow`. */
+export interface PromptWindow {
+  isDestroyed: () => boolean
+  webContents: WebContents
+}
+
 export function createCapabilityPromptSender(
-  broadcast: (channel: string, payload: unknown) => void
+  broadcast: (channel: string, payload: unknown) => void,
+  ensureVisibleWindow: () => PromptWindow
 ): {
   sendGrantRequest: (payload: unknown) => WebContents[]
   sendApprovalRequest: (payload: unknown) => WebContents[]
 } {
   return {
-    sendGrantRequest: (payload) => deliverPrompt("capabilities:grant-request", payload, broadcast),
+    sendGrantRequest: (payload) =>
+      deliverPrompt("capabilities:grant-request", payload, broadcast, ensureVisibleWindow),
     sendApprovalRequest: (payload) =>
-      deliverPrompt("capabilities:approval-request", payload, broadcast),
+      deliverPrompt("capabilities:approval-request", payload, broadcast, ensureVisibleWindow),
   }
 }
 
@@ -50,13 +58,14 @@ export function createCapabilityPromptSender(
  * target-scoping scenario.
  */
 export function createHostResourcePromptSender(
-  broadcast: (channel: string, payload: unknown) => void
+  broadcast: (channel: string, payload: unknown) => void,
+  ensureVisibleWindow: () => PromptWindow
 ): {
   sendApprovalRequest: (payload: unknown) => WebContents[]
 } {
   return {
     sendApprovalRequest: (payload) =>
-      deliverPrompt("host-resources:approval-request", payload, broadcast),
+      deliverPrompt("host-resources:approval-request", payload, broadcast, ensureVisibleWindow),
   }
 }
 
@@ -72,7 +81,8 @@ export function createHostResourcePromptSender(
 function deliverPrompt(
   channel: string,
   payload: unknown,
-  broadcast: (channel: string, payload: unknown) => void
+  broadcast: (channel: string, payload: unknown) => void,
+  ensureVisibleWindow: () => PromptWindow
 ): WebContents[] {
   const targeted = currentPromptTarget()
   if (targeted) {
@@ -90,6 +100,20 @@ function deliverPrompt(
   if (visible.length === 1) {
     visible[0]!.webContents.send(channel, payload)
     return [visible[0]!.webContents]
+  }
+
+  if (visible.length === 0) {
+    // Nothing is currently visible to show this prompt to — most notably,
+    // the app's normal tray-only state (main window created hidden, "shown
+    // on demand"). Sending only to hidden renderers would deliver the IPC
+    // event but never actually be seen, silently failing the request
+    // closed on timeout instead of ever reaching a real user decision.
+    // Surface a window now instead of falling through to broadcast.
+    const win = ensureVisibleWindow()
+    if (!win.isDestroyed() && isPromptCapableWebContents(win.webContents)) {
+      win.webContents.send(channel, payload)
+      return [win.webContents]
+    }
   }
 
   broadcast(channel, payload)

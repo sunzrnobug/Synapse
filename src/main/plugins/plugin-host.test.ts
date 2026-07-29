@@ -27,6 +27,7 @@ import {
   PluginPreferenceTypeError,
 } from "./plugin-host"
 import { PluginSandboxError } from "./plugin-sandbox"
+import { createInProcessPluginFork } from "./test-support/in-process-plugin-fork"
 
 let dir: string
 let backgroundHostsForCleanup: PluginHost[] = []
@@ -157,6 +158,7 @@ function hostOptions(
     adapters: noopAdapters,
     hotkeyAdapter: createHeadlessHotkeyAdapter(),
     workspaceRoots: { listForWorkspace: async () => [] },
+    sandboxForkProcess: createInProcessPluginFork(),
     ...runsSupport(dir),
     workspaces: {
       get: async (id: string) =>
@@ -210,13 +212,17 @@ async function writeHostPlugin(
     id?: string
     code?: string
     activationEvents?: PluginManifest["contributes"]["activationEvents"]
-    permissions?: string[]
+    permissions?: (string | { id: string; scope?: unknown })[]
     tools?: PluginManifest["contributes"]["tools"]
     triggers?: PluginManifest["triggers"]
+    credentials?: PluginManifest["contributes"]["credentials"]
+    /** Writes the plugin outside the normal user plugins dir — for a
+     *  dev-linked fixture, so it isn't also picked up by the userDir scan. */
+    rootDir?: string
   } = {}
 ): Promise<string> {
   const pluginId = options.id ?? "com.synapse.clipboard"
-  const pluginDir = path.join(dir, "plugins", pluginId)
+  const pluginDir = options.rootDir ?? path.join(dir, "plugins", pluginId)
   await fs.mkdir(path.join(pluginDir, "dist"), { recursive: true })
   await fs.writeFile(
     path.join(pluginDir, "synapse.json"),
@@ -235,10 +241,11 @@ async function writeHostPlugin(
           activationEvents: options.activationEvents,
           commands: [{ id: "clipboard.run", title: "Clipboard", mode: "view" }],
           tools: options.tools,
+          credentials: options.credentials,
         },
-        capabilities: (options.permissions ?? ["clipboard:read", "storage:plugin"]).map((id) => ({
-          id,
-        })),
+        capabilities: (options.permissions ?? ["clipboard:read", "storage:plugin"]).map((p) =>
+          typeof p === "string" ? { id: p } : p
+        ),
         triggers: options.triggers,
       },
       null,
@@ -263,12 +270,23 @@ module.exports = {
       const entries = (await ctx.storage.get("entries")) ?? []
       await ctx.storage.set("entries", entries.concat(event.content.text))
     }
+  },
+  triggers: {
+    async onTick(event, ctx) {}
   }
 }
 `,
     "utf-8"
   )
   return pluginDir
+}
+
+/** Registers `rootDir` in dev-plugins.json (the same file `link`/`unlink`
+ *  maintain) so a `writeHostPlugin({ rootDir: ... })` fixture is discovered
+ *  as a dev-source plugin instead of a user-installed one. */
+async function writeDevPluginsFile(rootDir: string): Promise<void> {
+  const devFilePath = path.join(dir, "dev-plugins.json")
+  await fs.writeFile(devFilePath, JSON.stringify([rootDir], null, 2))
 }
 
 const baseEntry: PluginRegistryEntry = {
@@ -607,6 +625,153 @@ describe("pluginHost grant migration", () => {
   })
 })
 
+describe("pluginHost.uninstall", () => {
+  it("revokes every capability grant, so reinstalling the same package doesn't silently restore them", async () => {
+    await writeHostPlugin({ permissions: ["clipboard:read", "storage:plugin"] })
+    const pluginId = "com.synapse.clipboard"
+    const host = makeHost()
+    await host.init()
+
+    const entry = host.get(pluginId)!
+    const identity = buildGrantIdentity(pluginId, entry.manifest!, entry.source.kind)
+    // Grandfathered on init (see the grant-store tests above).
+    expect(await host.grants.isGranted(identity, "clipboard:read")).toBe(true)
+    expect(await host.grants.isGranted(identity, "storage:plugin")).toBe(true)
+
+    await host.uninstall(pluginId)
+    expect(await host.grants.isGranted(identity, "clipboard:read")).toBe(false)
+    expect(await host.grants.isGranted(identity, "storage:plugin")).toBe(false)
+
+    // Reinstalling the exact same package (same publisher/signature/declared
+    // capabilities => same GrantIdentity) must start from zero, not
+    // silently regain everything the user revoked by uninstalling.
+    await writeHostPlugin({ permissions: ["clipboard:read", "storage:plugin"] })
+    await host.reload()
+    const reinstalled = host.get(pluginId)!
+    const reinstalledIdentity = buildGrantIdentity(
+      pluginId,
+      reinstalled.manifest!,
+      reinstalled.source.kind
+    )
+    expect(reinstalledIdentity).toEqual(identity)
+    expect(await host.grants.isGranted(reinstalledIdentity, "clipboard:read")).toBe(false)
+    expect(await host.grants.isGranted(reinstalledIdentity, "storage:plugin")).toBe(false)
+  })
+
+  it("purges grants recorded under any historical identity for this pluginId, not just the currently-installed manifest's", async () => {
+    await writeHostPlugin({ permissions: ["clipboard:read"] })
+    const pluginId = "com.synapse.clipboard"
+    const host = makeHost()
+    await host.init()
+
+    const entry = host.get(pluginId)!
+    const currentIdentity = buildGrantIdentity(pluginId, entry.manifest!, entry.source.kind)
+    // Simulate a grant left over from a previous version of this exact
+    // plugin (different declared capabilities => different declaration
+    // hash) that was upgraded in place without ever being uninstalled.
+    const staleIdentity = {
+      ...currentIdentity,
+      capabilityDeclarationHash: "stale-hash-from-a-previous-version",
+    }
+    await host.grants.grant(staleIdentity, "clipboard:watch", "user")
+    expect(await host.grants.isGranted(staleIdentity, "clipboard:watch")).toBe(true)
+
+    await host.uninstall(pluginId)
+
+    // Downgrading to (or otherwise reconstructing) that old identity must
+    // not find a still-live grant waiting for it.
+    expect(await host.grants.isGranted(staleIdentity, "clipboard:watch")).toBe(false)
+    expect(await host.grants.isGranted(currentIdentity, "clipboard:read")).toBe(false)
+  })
+
+  it("disconnects every declared credential", async () => {
+    await writeHostPlugin({
+      permissions: [
+        "storage:plugin",
+        { id: "network:https", scope: { hosts: ["api.example.com"] } },
+        {
+          id: "credentials:broker",
+          scope: {
+            credentialIds: ["myApiKey"],
+            inject: [{ credentialId: "myApiKey", scope: { hosts: ["api.example.com"] } }],
+          },
+        },
+      ],
+      credentials: [
+        {
+          id: "myApiKey",
+          type: "static",
+          label: "My API Key",
+          inject: { scheme: "bearer" },
+        },
+      ],
+    })
+    const pluginId = "com.synapse.clipboard"
+    const host = makeHost()
+    await host.init()
+    const disconnectSpy = vi.spyOn(host.credentialBroker, "disconnect")
+
+    await host.uninstall(pluginId)
+
+    expect(disconnectSpy).toHaveBeenCalledWith(
+      pluginId,
+      expect.objectContaining({ id: pluginId }),
+      "user",
+      "myApiKey"
+    )
+  })
+
+  it("revokes trigger-use grants on uninstall (not just when disabling normally)", async () => {
+    await writeHostPlugin({
+      permissions: [],
+      triggers: [
+        {
+          id: "tick",
+          type: "timer",
+          handler: "triggers.onTick",
+          schedule: { intervalMs: 60_000 },
+          // clipboard:read is "consent" tier and not on the explicit-trigger-
+          // confirmation exclusion list, so grantTriggerUses() auto-grants it
+          // on init — unlike storage:plugin, which is "auto" tier and never
+          // gets a grant record at all (always allowed, nothing to revoke).
+          uses: [{ capability: "clipboard:read", budget: { maxCalls: 10, period: "1h" } }],
+        },
+      ],
+    })
+    const pluginId = "com.synapse.clipboard"
+    const host = makeHost()
+    await host.init()
+
+    const entry = host.get(pluginId)!
+    const identity = buildGrantIdentity(pluginId, entry.manifest!, entry.source.kind)
+    expect(await host.grants.isGranted(identity, "clipboard:read")).toBe(true)
+
+    await host.uninstall(pluginId)
+    expect(await host.grants.isGranted(identity, "clipboard:read")).toBe(false)
+  })
+
+  it("dev-linked plugin uninstall also revokes grants, not just unlinking the dev-plugins.json reference", async () => {
+    const pluginId = "com.synapse.devtest"
+    const devRoot = path.join(dir, "dev-source", pluginId)
+    await writeHostPlugin({ id: pluginId, permissions: ["clipboard:read"], rootDir: devRoot })
+    await writeDevPluginsFile(devRoot)
+    const host = makeHost()
+    await host.init()
+
+    const entry = host.get(pluginId)!
+    expect(entry.source.kind).toBe("dev")
+    const identity = buildGrantIdentity(pluginId, entry.manifest!, entry.source.kind)
+    expect(await host.grants.isGranted(identity, "clipboard:read")).toBe(true)
+
+    await host.uninstall(pluginId)
+
+    expect(await host.grants.isGranted(identity, "clipboard:read")).toBe(false)
+    // Re-linking the same dev build later must not silently regain the grant.
+    await host.reload()
+    expect(host.get(pluginId)).toBeUndefined()
+  })
+})
+
 describe("pluginHost.revokeCapability", () => {
   it("removes the clipboard:watch grant and stops the host clipboard watcher", async () => {
     vi.useFakeTimers()
@@ -648,13 +813,19 @@ describe("pluginHost.revokeCapability", () => {
     }
   })
 
-  it("clears all sandbox timers and intervals for the plugin (plugin-wide teardown)", async () => {
+  it("tears down and transparently reloads the plugin's sandbox process on any capability revoke (plugin-wide teardown)", async () => {
+    // Pre-migration (node:vm), this asserted the sandbox's own tracked
+    // setTimeout/setInterval handles were cleared — a concept that no longer
+    // exists now that plugin code runs in a real OS process the host can't
+    // introspect (see PluginProcessHost.abortPluginCapability's docs). The
+    // guarantee that actually matters at this layer is: revoking ANY
+    // capability tears the plugin's process down and reloads it
+    // transparently — proven by the sandbox spy plus the plugin still being
+    // fully usable immediately after.
     const host = makeHost()
     const pluginId = "com.synapse.clipboard"
     await writeHostPlugin({
       code: `
-setInterval(() => {}, 60_000)
-setTimeout(() => {}, 60_000)
 module.exports = {
   commands: {
     "clipboard.run": {
@@ -669,11 +840,14 @@ module.exports = {
     })
 
     await host.init()
-    expect(host.sandbox.trackedWorkCounts(pluginId)).toEqual({ timers: 1, intervals: 1 })
+    const abortSpy = vi.spyOn(host.sandbox, "abortPluginCapability")
 
     await host.revokeCapability(pluginId, "storage:plugin")
 
-    expect(host.sandbox.trackedWorkCounts(pluginId)).toEqual({ timers: 0, intervals: 0 })
+    expect(abortSpy).toHaveBeenCalledWith(pluginId, "storage:plugin")
+    await expect(
+      host.sandbox.invokeCommand({ pluginId, commandId: "clipboard.run", phase: "run" })
+    ).resolves.toEqual({ type: "toast", level: "info", message: "ok" })
   })
 
   it("aborts an in-flight tool via capabilityAbort when any capability is revoked", async () => {
@@ -1237,6 +1411,7 @@ describe("github inbox bundled plugin", () => {
       hotkeyAdapter: createHeadlessHotkeyAdapter(),
       fsWatchAdapter: noopFsWatchAdapter,
       workspaceRoots: { listForWorkspace: async () => [] },
+      sandboxForkProcess: createInProcessPluginFork(),
       ...runsSupport(dir),
       capabilityGovernance: {
         userDataDir: dir,

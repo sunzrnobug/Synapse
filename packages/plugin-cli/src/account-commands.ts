@@ -5,6 +5,7 @@ import type { MarketplaceClient } from "./marketplace-client"
 import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"
 import { promises as fs } from "node:fs"
+import process from "node:process"
 import { MarketplaceApiError } from "./marketplace-client"
 
 /** Side-effecting capabilities the commands need, injected for testability. */
@@ -20,6 +21,22 @@ export interface AccountDeps {
   store: CredentialStore
   baseUrl: string
   io: CommandIo
+  /** A token supplied directly for this invocation (e.g. `--token-stdin`).
+   *  Takes priority over SYNAPSE_TOKEN and the persisted store — neither is
+   *  even consulted when this is set. */
+  token?: string
+}
+
+/**
+ * Token resolution order for a single command invocation: an explicitly
+ * supplied token (e.g. `--token-stdin`) > the SYNAPSE_TOKEN env var (keeps
+ * existing automation scripts working) > the persisted credential store.
+ * Only the last of these round-trips through a system credential helper.
+ */
+async function resolveToken(deps: AccountDeps): Promise<string | undefined> {
+  if (deps.token) return deps.token
+  if (process.env.SYNAPSE_TOKEN) return process.env.SYNAPSE_TOKEN
+  return deps.store.get(deps.baseUrl)
 }
 
 /** Build a plugin into a `.syn` package — injected so publish stays unit-testable. */
@@ -67,8 +84,8 @@ export async function runLogin(deps: AccountDeps): Promise<void> {
 
 /** Print the authenticated user. */
 export async function runWhoami(deps: AccountDeps): Promise<void> {
-  const { client, store, baseUrl, io } = deps
-  const token = await store.get(baseUrl)
+  const { client, io } = deps
+  const token = await resolveToken(deps)
   if (!token) throw new NotLoggedInError()
   try {
     const { user } = await client.session(token)
@@ -95,8 +112,8 @@ export interface PublishDeps extends AccountDeps {
 
 /** Build the plugin and publish it to the marketplace. */
 export async function runPublish(deps: PublishDeps): Promise<void> {
-  const { client, store, baseUrl, io, projectDir, visibility, build } = deps
-  const token = await store.get(baseUrl)
+  const { client, io, projectDir, visibility, build } = deps
+  const token = await resolveToken(deps)
   if (!token) throw new NotLoggedInError()
 
   const built = await build(projectDir)

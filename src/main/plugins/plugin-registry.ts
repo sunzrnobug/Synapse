@@ -1,3 +1,4 @@
+import type { TriggerDeclaration } from "@synapse/plugin-manifest"
 import type {
   ClipboardContent,
   LocalizedString,
@@ -24,7 +25,7 @@ import { fuzzyMatch } from "../launcher/search"
 import { logger } from "../logging"
 import { CapabilityDenied } from "./capability-gate"
 import { PermissionDenied } from "./permissions"
-import { PluginInvocationTimeoutError } from "./plugin-sandbox"
+import { PluginCallCancelledError, PluginInvocationTimeoutError } from "./plugin-sandbox"
 import { toolFqName } from "./types"
 
 /**
@@ -57,6 +58,8 @@ export interface PluginRegistryOptions {
 interface CommandIndexEntry {
   pluginId: string
   command: ManifestCommand
+  /** The plugin manifest's top-level icon, used when the command declares none of its own. */
+  manifestIcon?: string
 }
 
 interface ToolIndexEntry {
@@ -145,6 +148,7 @@ export class PluginRegistry extends EventEmitter<PluginRegistryEvents> {
       })
       validateManifestCommands(entry.manifest.contributes.commands, loaded.module.commands)
       validateManifestTools(entry.manifest.contributes.tools, loaded.module.tools)
+      validateManifestTriggers(entry.manifest.triggers, loaded.module.triggers)
       validateActivationEvents(entry.manifest, loaded.module)
       this.indexActivationEvents(entry.manifest, loaded.module)
       const next = { ...entry, status: "active" as const, error: undefined, loadedAt: this.now() }
@@ -172,7 +176,7 @@ export class PluginRegistry extends EventEmitter<PluginRegistryEvents> {
         commandId: indexed.command.id,
         title: indexed.command.title,
         subtitle: indexed.command.subtitle,
-        icon: indexed.command.icon,
+        icon: indexed.command.icon ?? indexed.manifestIcon,
         mode: indexed.command.mode,
         score: match.score,
         matches: match.matches,
@@ -196,7 +200,8 @@ export class PluginRegistry extends EventEmitter<PluginRegistryEvents> {
       if (
         err instanceof PermissionDenied ||
         err instanceof CapabilityDenied ||
-        err instanceof PluginInvocationTimeoutError
+        err instanceof PluginInvocationTimeoutError ||
+        err instanceof PluginCallCancelledError
       )
         throw err
       this.markCrashed(request.pluginId, err)
@@ -235,13 +240,33 @@ export class PluginRegistry extends EventEmitter<PluginRegistryEvents> {
     const indexed = this.toolIndex.get(toolFqName(pluginId, toolName))
     if (!indexed) throw new Error(`Plugin tool not found: ${toolFqName(pluginId, toolName)}`)
 
-    return this.options.sandbox.invokeTool({
-      pluginId,
-      toolName,
-      input,
-      capabilities: indexed.tool.capabilities,
-      options,
-    })
+    try {
+      return await this.options.sandbox.invokeTool({
+        pluginId,
+        toolName,
+        input,
+        capabilities: indexed.tool.capabilities,
+        options,
+      })
+    } catch (err) {
+      // sandbox.invokeTool only ever throws for infrastructure failures — a
+      // fault inside the tool handler itself already comes back as a
+      // resolved isError ToolResult. Permission denials and timeouts are
+      // already-classified policy/budget decisions, not plugin defects;
+      // anything else (e.g. the plugin's process crashed between calls)
+      // means the sandbox and the registry have fallen out of sync, so mark
+      // the plugin crashed the same way invoke()/disposeCommand()/
+      // dispatchEvent() already do.
+      if (
+        err instanceof PermissionDenied ||
+        err instanceof CapabilityDenied ||
+        err instanceof PluginInvocationTimeoutError ||
+        err instanceof PluginCallCancelledError
+      )
+        throw err
+      this.markCrashed(pluginId, err)
+      throw new PluginCrashedError(pluginId, err)
+    }
   }
 
   async disposeCommand(pluginId: string, commandId: string): Promise<void> {
@@ -251,7 +276,8 @@ export class PluginRegistry extends EventEmitter<PluginRegistryEvents> {
       if (
         err instanceof PermissionDenied ||
         err instanceof CapabilityDenied ||
-        err instanceof PluginInvocationTimeoutError
+        err instanceof PluginInvocationTimeoutError ||
+        err instanceof PluginCallCancelledError
       )
         throw err
       this.markCrashed(pluginId, err)
@@ -310,7 +336,8 @@ export class PluginRegistry extends EventEmitter<PluginRegistryEvents> {
       if (
         err instanceof PermissionDenied ||
         err instanceof CapabilityDenied ||
-        err instanceof PluginInvocationTimeoutError
+        err instanceof PluginInvocationTimeoutError ||
+        err instanceof PluginCallCancelledError
       )
         throw err
       this.markCrashed(request.pluginId, err)
@@ -336,6 +363,7 @@ export class PluginRegistry extends EventEmitter<PluginRegistryEvents> {
       const loaded = await this.options.sandbox.loadPlugin(plugin)
       validateManifestCommands(plugin.manifest.contributes.commands, loaded.module.commands)
       validateManifestTools(plugin.manifest.contributes.tools, loaded.module.tools)
+      validateManifestTriggers(plugin.manifest.triggers, loaded.module.triggers)
       validateActivationEvents(plugin.manifest, loaded.module)
       this.indexActivationEvents(plugin.manifest, loaded.module)
       const entry: PluginRegistryEntry = {
@@ -368,6 +396,7 @@ export class PluginRegistry extends EventEmitter<PluginRegistryEvents> {
       this.commandIndex.set(commandIndexKey(entry.pluginId, command.id), {
         pluginId: entry.pluginId,
         command,
+        manifestIcon: entry.manifest.icon,
       })
     }
   }
@@ -397,6 +426,7 @@ export class PluginRegistry extends EventEmitter<PluginRegistryEvents> {
   private markCrashed(pluginId: string, err: unknown): void {
     const entry = this.entries.get(pluginId)
     if (!entry) return
+    logger.error("plugin crashed", { pluginId, err })
     this.removeCommands(pluginId)
     this.removeTools(pluginId)
     this.clipboardChangeListeners.delete(pluginId)
@@ -458,6 +488,20 @@ function validateManifestTools(
   for (const tool of tools ?? []) {
     if (!exported?.[tool.name]) {
       throw new Error(`Manifest tool is not exported by plugin module: ${tool.name}`)
+    }
+  }
+}
+
+function validateManifestTriggers(
+  triggers: TriggerDeclaration[] | undefined,
+  exported: Record<string, unknown> | undefined
+): void {
+  for (const trigger of triggers ?? []) {
+    const exportName = trigger.handler.slice("triggers.".length)
+    if (typeof exported?.[exportName] !== "function") {
+      throw new TypeError(
+        `Manifest trigger handler is not exported by plugin module: ${trigger.handler}`
+      )
     }
   }
 }

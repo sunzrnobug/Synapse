@@ -11,7 +11,7 @@ import {
   PluginPreferenceTypeError,
 } from "../plugins/plugin-host"
 import { PluginCrashedError } from "../plugins/plugin-registry"
-import { PluginInvocationTimeoutError } from "../plugins/plugin-sandbox"
+import { PluginCallCancelledError, PluginInvocationTimeoutError } from "../plugins/plugin-sandbox"
 import { withCapabilityPromptTarget } from "./capability-prompt-router"
 
 export type PluginIpcErrorCode =
@@ -22,6 +22,7 @@ export type PluginIpcErrorCode =
   | "PLUGIN_NOT_ACTIVE"
   | "PLUGIN_PERMISSION_DENIED"
   | "PLUGIN_CRASHED"
+  | "PLUGIN_CALL_CANCELLED"
   | "PLUGIN_INVOCATION_TIMEOUT"
   | "PLUGIN_NOT_IMPLEMENTED"
   | "PLUGIN_INSTALL_ERROR"
@@ -501,6 +502,18 @@ function toPluginIpcError(err: unknown): PluginIpcError {
     return {
       code: "PLUGIN_CRASHED",
       message: "Plugin crashed.",
+      details: { pluginId: err.pluginId },
+    }
+  }
+
+  // Not a crash: abortPluginCapability/unloadPlugin intentionally cancel any
+  // in-flight call when a capability is revoked or the plugin is unloaded
+  // mid-call. Callers can use this code to distinguish that expected outcome
+  // from PLUGIN_CRASHED / UNKNOWN_ERROR.
+  if (err instanceof PluginCallCancelledError) {
+    return {
+      code: "PLUGIN_CALL_CANCELLED",
+      message: "Plugin call was cancelled.",
       details: { pluginId: err.pluginId },
     }
   }

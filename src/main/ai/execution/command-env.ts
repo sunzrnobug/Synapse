@@ -1,64 +1,55 @@
 import process from "node:process"
 
-/** Keys always stripped from command subprocess environments. */
-const SENSITIVE_EXACT = new Set([
-  "AWS_ACCESS_KEY_ID",
-  "AWS_SECRET_ACCESS_KEY",
-  "AWS_SESSION_TOKEN",
-  "GITHUB_TOKEN",
-  "GH_TOKEN",
-  "NPM_TOKEN",
-  "OPENAI_API_KEY",
-  "ANTHROPIC_API_KEY",
-  "GOOGLE_API_KEY",
-  "AZURE_OPENAI_API_KEY",
-  "DATABASE_URL",
-  "REDIS_URL",
-  "JWT_SECRET",
-  "SECRET_KEY",
-  "PRIVATE_KEY",
-  "SSH_AUTH_SOCK",
+/**
+ * The only variables passed through to a workspace command subprocess.
+ * Deliberately excludes NODE_OPTIONS/PYTHONPATH/GIT_* and similar
+ * behavior-changing variables: even though they aren't secrets, silently
+ * inheriting them from a potentially-tainted host environment can change
+ * what a spawned node/python/git actually does. An allowlist can't miss an
+ * unanticipated secret shape the way the old denylist did.
+ */
+const ALLOWED_KEYS = new Set([
+  "PATH",
+  "HOME",
+  "USERPROFILE",
+  "SystemRoot",
+  "windir",
+  // Windows command resolution (cmd.exe/PowerShell) needs this to know which
+  // extensions count as executable when a command is invoked by a bare name
+  // (e.g. `node` instead of `node.exe`) — without it, spawning a shell that
+  // then runs an unqualified command can fail to find it at all.
+  "PATHEXT",
+  "TEMP",
+  "TMP",
+  "COMSPEC",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "LANGUAGE",
+  // Windows PowerShell (powershell.exe) startup path/module resolution.
+  // None of these are secrets — just standard per-machine system
+  // locations — but missing them has been observed causing powershell.exe
+  // to hang indefinitely on startup (before it even runs the given
+  // command) on some Windows CI images, rather than merely running slowly.
+  "PSModulePath",
+  "ProgramFiles",
+  "ProgramFiles(x86)",
+  "ProgramData",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "NUMBER_OF_PROCESSORS",
+  "PROCESSOR_ARCHITECTURE",
 ])
 
-const SENSITIVE_PREFIXES = [
-  "AWS_",
-  "AZURE_",
-  "GITHUB_",
-  "GITLAB_",
-  "NPM_",
-  "PNPM_",
-  "OPENAI_",
-  "ANTHROPIC_",
-  "GOOGLE_",
-  "STRIPE_",
-  "TWILIO_",
-  "SENTRY_",
-  "DATADOG_",
-  "VAULT_",
-  "CREDENTIAL_",
-  "TOKEN_",
-  "SECRET_",
-  "PASSWORD_",
-  "API_KEY_",
-]
-
 /**
- * Build a minimized environment for workspace command execution.
- * Strips common secret-bearing variables while preserving PATH and locale.
+ * Build a minimized environment for workspace command execution: only
+ * allowlisted variables are passed through, everything else is dropped.
  */
 export function sandboxCommandEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {}
-  for (const [key, value] of Object.entries(source)) {
-    if (value === undefined || isSensitiveEnvKey(key)) continue
-    env[key] = value
+  for (const key of ALLOWED_KEYS) {
+    const value = source[key]
+    if (value !== undefined) env[key] = value
   }
   return env
-}
-
-function isSensitiveEnvKey(key: string): boolean {
-  const upper = key.toUpperCase()
-  if (SENSITIVE_EXACT.has(upper)) return true
-  if (SENSITIVE_PREFIXES.some((prefix) => upper.startsWith(prefix))) return true
-  if (/(?:_TOKEN|_SECRET|_PASSWORD|_API_KEY|_CREDENTIAL)$/i.test(upper)) return true
-  return false
 }

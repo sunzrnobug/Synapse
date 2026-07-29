@@ -44,17 +44,32 @@ async function writeScript(dir: string, name: string, source: string): Promise<s
 }
 
 describe("runCommand — legacy in-memory path (no artifacts option)", () => {
-  it("runs a simple command with exit code 0", async () => {
+  // Real powershell.exe spawns. Vitest's default 5s test timeout has no
+  // margin for one. Two things matter here, not just one:
+  // 1. An explicit runCommand `timeoutMs` well below the outer Vitest
+  //    timeout, so runCommand's OWN kill logic always fires first. Without
+  //    this, a slow/contended CI moment can make Vitest abandon the test
+  //    before runCommand's (30s-default) internal timer ever fires — and
+  //    Vitest never kills the underlying child process on its own, so the
+  //    orphan keeps running and holds a Windows-exclusive file lock inside
+  //    its temp workspace, corrupting every later test's fs.rm() cleanup
+  //    with EBUSY/ENOTEMPTY. Bounding runCommand's own timeout guarantees a
+  //    clean, timely return (timedOut:true in the worst case) instead of an
+  //    orphan, regardless of how contended the runner is.
+  // 2. retry (the standard mitigation for CI-load-sensitive real-process
+  //    tests), for the rare case (1) still produces a slow-but-not-hung
+  //    result that fails this test's assertions.
+  it("runs a simple command with exit code 0", { timeout: 20_000, retry: 2 }, async () => {
     const root = await makeWorkspace()
     const policy = new WorkspacePolicy([{ id: "repo", root }])
     const command = process.platform === "win32" ? "Write-Output ok" : "echo ok"
-    const result = await runCommand(policy, { rootId: "repo", command })
+    const result = await runCommand(policy, { rootId: "repo", command, timeoutMs: 10_000 })
     expect(result.exitCode).toBe(0)
     expect(result.legacyStdout).toContain("ok")
     expect(result.stdout).toBeUndefined()
   })
 
-  it("returns non-zero exit codes", async () => {
+  it("returns non-zero exit codes", { timeout: 20_000, retry: 2 }, async () => {
     const root = await makeWorkspace()
     const policy = new WorkspacePolicy([{ id: "repo", root }])
     const command = process.platform === "win32" ? "exit 3" : "exit 3"
@@ -72,7 +87,7 @@ describe("runCommand — legacy in-memory path (no artifacts option)", () => {
       timeoutMs: 200,
     })
     expect(result.timedOut).toBe(true)
-  }, 15_000)
+  }, 30_000)
 
   it("cancels via AbortSignal", async () => {
     const root = await makeWorkspace()
@@ -87,64 +102,74 @@ describe("runCommand — legacy in-memory path (no artifacts option)", () => {
     controller.abort()
     const result = await pending
     expect(result.cancelled).toBe(true)
-  }, 15_000)
+  }, 30_000)
 })
 
 describe("runCommand — artifact-backed capture path", () => {
-  it("captures stdout as a durable, complete artifact with bounded head/tail previews", async () => {
-    const root = await makeWorkspace()
-    const policy = new WorkspacePolicy([{ id: "repo", root }])
-    const artifactsDir = await makeArtifactsDir()
-    const store = new ArtifactStore(artifactsDir, { statDiskSpace: ampleDisk })
-    const command = process.platform === "win32" ? "Write-Output ok" : "echo ok"
+  it(
+    "captures stdout as a durable, complete artifact with bounded head/tail previews",
+    { timeout: 20_000, retry: 2 },
+    async () => {
+      const root = await makeWorkspace()
+      const policy = new WorkspacePolicy([{ id: "repo", root }])
+      const artifactsDir = await makeArtifactsDir()
+      const store = new ArtifactStore(artifactsDir, { statDiskSpace: ampleDisk })
+      const command = process.platform === "win32" ? "Write-Output ok" : "echo ok"
 
-    const result = await runCommand(policy, {
-      rootId: "repo",
-      command,
-      artifacts: { store, owner: owner() },
-    })
+      const result = await runCommand(policy, {
+        rootId: "repo",
+        command,
+        timeoutMs: 10_000,
+        artifacts: { store, owner: owner() },
+      })
 
-    expect(result.exitCode).toBe(0)
-    expect(result.legacyStdout).toBeUndefined()
-    expect(result.stdout?.artifact.complete).toBe(true)
-    expect(result.stdout?.artifact.truncationReason).toBeUndefined()
-    expect(result.stdout?.headPreview).toContain("ok")
-    expect(result.stdout?.tailPreview).toContain("ok")
-    expect(result.stdout?.artifact.uri).toBe(
-      `artifact://run/run-1/${result.stdout?.artifact.artifactId}`
-    )
-    expect(result.stderr?.artifact.complete).toBe(true)
-  })
+      expect(result.exitCode).toBe(0)
+      expect(result.legacyStdout).toBeUndefined()
+      expect(result.stdout?.artifact.complete).toBe(true)
+      expect(result.stdout?.artifact.truncationReason).toBeUndefined()
+      expect(result.stdout?.headPreview).toContain("ok")
+      expect(result.stdout?.tailPreview).toContain("ok")
+      expect(result.stdout?.artifact.uri).toBe(
+        `artifact://run/run-1/${result.stdout?.artifact.artifactId}`
+      )
+      expect(result.stderr?.artifact.complete).toBe(true)
+    }
+  )
 
-  it("captures output above the legacy preview cap but below artifact limits, and survives a store restart", async () => {
-    const root = await makeWorkspace()
-    const policy = new WorkspacePolicy([{ id: "repo", root }])
-    const artifactsDir = await makeArtifactsDir()
-    const store = new ArtifactStore(artifactsDir, { statDiskSpace: ampleDisk })
-    const size = 40_000 // > legacy 32,000-char cap, << the 64 MiB artifact ceiling
-    const command =
-      process.platform === "win32"
-        ? `Write-Output ('a' * ${size})`
-        : `node -e "process.stdout.write('a'.repeat(${size}))"`
+  it(
+    "captures output above the legacy preview cap but below artifact limits, and survives a store restart",
+    { timeout: 20_000, retry: 2 },
+    async () => {
+      const root = await makeWorkspace()
+      const policy = new WorkspacePolicy([{ id: "repo", root }])
+      const artifactsDir = await makeArtifactsDir()
+      const store = new ArtifactStore(artifactsDir, { statDiskSpace: ampleDisk })
+      const size = 40_000 // > legacy 32,000-char cap, << the 64 MiB artifact ceiling
+      const command =
+        process.platform === "win32"
+          ? `Write-Output ('a' * ${size})`
+          : `node -e "process.stdout.write('a'.repeat(${size}))"`
 
-    const result = await runCommand(policy, {
-      rootId: "repo",
-      command,
-      artifacts: { store, owner: owner() },
-    })
+      const result = await runCommand(policy, {
+        rootId: "repo",
+        command,
+        timeoutMs: 10_000,
+        artifacts: { store, owner: owner() },
+      })
 
-    expect(result.stdout?.artifact.complete).toBe(true)
-    expect(result.stdout?.artifact.capturedBytes).toBeGreaterThanOrEqual(size)
+      expect(result.stdout?.artifact.complete).toBe(true)
+      expect(result.stdout?.artifact.capturedBytes).toBeGreaterThanOrEqual(size)
 
-    // Simulate a full process restart: a fresh ArtifactStore instance
-    // pointed at the same baseDir must still be able to read the complete
-    // artifact back, byte-for-byte and hash-for-hash.
-    const restarted = new ArtifactStore(artifactsDir, { statDiskSpace: ampleDisk })
-    const ref = result.stdout!.artifact
-    const bytes = await restarted.read(ref, { start: 0 }, { ...owner() })
-    expect(bytes.length).toBe(ref.capturedBytes)
-    expect(createHash("sha256").update(bytes).digest("hex")).toBe(ref.sha256)
-  })
+      // Simulate a full process restart: a fresh ArtifactStore instance
+      // pointed at the same baseDir must still be able to read the complete
+      // artifact back, byte-for-byte and hash-for-hash.
+      const restarted = new ArtifactStore(artifactsDir, { statDiskSpace: ampleDisk })
+      const ref = result.stdout!.artifact
+      const bytes = await restarted.read(ref, { start: 0 }, { ...owner() })
+      expect(bytes.length).toBe(ref.capturedBytes)
+      expect(createHash("sha256").update(bytes).digest("hex")).toBe(ref.sha256)
+    }
+  )
 
   it("kills the entire process tree when stdout exceeds its artifact quota, without deadlocking stderr's undrained pipe", async () => {
     const root = await makeWorkspace()
@@ -216,30 +241,30 @@ describe("runCommand — artifact-backed capture path", () => {
       scriptDir,
       "trickle.js",
       [
-        "let i = 0",
         "function loop() {",
-        "  if (i++ < 100000) {",
-        "    process.stdout.write('o'.repeat(200))",
-        "    process.stderr.write('e'.repeat(200))",
-        "    setImmediate(loop)",
-        "  }",
+        "  process.stdout.write('o'.repeat(200))",
+        "  process.stderr.write('e'.repeat(200))",
+        "  setImmediate(loop)",
         "}",
         "loop()",
       ].join("\n")
     )
     const command = `node "${script}"`
 
-    // Generous enough for node.exe's own startup (which can itself take
-    // well over 100ms) to complete and several setImmediate iterations to
-    // flow before the timeout fires. The tight, uncapped setImmediate
-    // loop above (as opposed to a slow interval) keeps a steady backlog
-    // of unconsumed chunks queued on both streams at essentially any
-    // instant, so whenever the kill/abort actually lands, capture()'s
-    // per-chunk producer.signal check gets a real chance to observe it —
-    // a timeout racing a source that's already gone idle (nothing left
-    // to check the signal against before EOF) can't reliably distinguish
-    // "correctly marked producer-aborted" from capture()'s own signal
-    // check simply never getting invoked again.
+    // Loops unconditionally rather than to a fixed iteration count: the
+    // process is force-killed by the timeout/abort regardless, so there is
+    // no natural end for it to race against. A fixed count risked finishing
+    // on its own before the timeout fired on a fast machine, making the
+    // test flaky in the opposite direction (timedOut/cancelled ending up
+    // false because the process exited normally first). The tight,
+    // uncapped setImmediate loop (as opposed to a slow interval) keeps a
+    // steady backlog of unconsumed chunks queued on both streams at
+    // essentially any instant, so whenever the kill/abort actually lands,
+    // capture()'s per-chunk producer.signal check gets a real chance to
+    // observe it — a timeout racing a source that's already gone idle
+    // (nothing left to check the signal against before EOF) can't reliably
+    // distinguish "correctly marked producer-aborted" from capture()'s own
+    // signal check simply never getting invoked again.
     const result = await runCommand(policy, {
       rootId: "repo",
       command,
@@ -252,7 +277,7 @@ describe("runCommand — artifact-backed capture path", () => {
     expect(result.stdout?.artifact.truncationReason).toBe("producer-aborted")
     expect(result.stderr?.artifact.complete).toBe(false)
     expect(result.stderr?.artifact.truncationReason).toBe("producer-aborted")
-  }, 15_000)
+  }, 30_000)
 
   it("marks both stdout and stderr artifacts producer-aborted when cancelled via AbortSignal mid-stream", async () => {
     const root = await makeWorkspace()
@@ -264,13 +289,10 @@ describe("runCommand — artifact-backed capture path", () => {
       scriptDir,
       "trickle.js",
       [
-        "let i = 0",
         "function loop() {",
-        "  if (i++ < 100000) {",
-        "    process.stdout.write('o'.repeat(200))",
-        "    process.stderr.write('e'.repeat(200))",
-        "    setImmediate(loop)",
-        "  }",
+        "  process.stdout.write('o'.repeat(200))",
+        "  process.stderr.write('e'.repeat(200))",
+        "  setImmediate(loop)",
         "}",
         "loop()",
       ].join("\n")
@@ -300,5 +322,5 @@ describe("runCommand — artifact-backed capture path", () => {
     expect(result.stdout?.artifact.truncationReason).toBe("producer-aborted")
     expect(result.stderr?.artifact.complete).toBe(false)
     expect(result.stderr?.artifact.truncationReason).toBe("producer-aborted")
-  }, 15_000)
+  }, 30_000)
 })

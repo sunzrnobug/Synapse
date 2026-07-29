@@ -1,4 +1,8 @@
-import type { CapabilityApprover, CapabilityRequest } from "../plugins/capability-gate"
+import type {
+  CapabilityApprover,
+  CapabilityRequest,
+  GrantPromptPort,
+} from "../plugins/capability-gate"
 import type { PluginBridgeAdapters } from "../plugins/plugin-bridge"
 import { spawn } from "node:child_process"
 import * as os from "node:os"
@@ -102,6 +106,17 @@ async function main(): Promise<void> {
       request: stripSignal(request),
       signal: request.signal,
     })
+  // Without this, CapabilityGovernance's own default (capability-governance.ts)
+  // auto-allows every first-time JIT grant whenever no GUI is attached to
+  // answer it — silently defeating "no silent auto-allow" for exactly the
+  // unattended, headless-server case that most needs the fail-closed default.
+  const prompt: GrantPromptPort = ({ identity, request, tier }) =>
+    guiApprovalPort.requestPrompt({
+      identity,
+      request: stripSignal(request),
+      tier,
+      signal: request.signal,
+    })
 
   // "tools-only" mode skips trigger registration, so no background-agent run
   // is ever dispatched here — these are supplied only because
@@ -143,12 +158,16 @@ async function main(): Promise<void> {
     adapters: headlessAdapters(),
     fetch: (url, init) => globalThis.fetch(url, init),
     runtime: () => ({ locale: "en", theme: { mode: "light", accent: "neutral" } }),
-    capabilityGovernance: { userDataDir, approve },
+    capabilityGovernance: { userDataDir, approve, prompt },
     runStore,
     budgetStore: new RootBudgetLedgerStore(path.join(userDataDir, "ai", "budget")),
     upsertTrace: (input) => upsertRunTrace(runsDir, input),
     workspaceRoots: workspaceRootStore,
     mode: "tools-only",
+    // __dirname here is this actual entry chunk's own folder (out/main/) —
+    // a sibling build output, same pattern as src/main/index.ts's own
+    // reference to this file (mcp-stdio.js) from the "index" entry.
+    sandboxEntryScriptPath: path.join(__dirname, "plugin-runtime-entry.js"),
   })
 
   await pluginHost.init()

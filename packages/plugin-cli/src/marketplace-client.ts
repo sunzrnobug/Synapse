@@ -7,6 +7,13 @@ import type {
 } from "@synapsepkg/marketplace-types"
 import type { PluginManifest } from "@synapsepkg/plugin-manifest"
 import type { Buffer } from "node:buffer"
+import type { z } from "zod"
+import {
+  deviceCodePollResponseSchema,
+  deviceCodeStartResponseSchema,
+  publishResponseSchema,
+  sessionResponseSchema,
+} from "@synapsepkg/marketplace-types"
 
 /** Error carrying the marketplace API's status + machine code. */
 export class MarketplaceApiError extends Error {
@@ -63,7 +70,24 @@ export function createMarketplaceClient(options: ClientOptions): MarketplaceClie
     throw new MarketplaceApiError(res.status, code, message)
   }
 
-  async function postJson<T>(path: string, body: unknown, token?: string): Promise<T> {
+  function parse<T>(res: Response, schema: z.ZodType<T>, json: unknown): T {
+    const result = schema.safeParse(json)
+    if (!result.success) {
+      throw new MarketplaceApiError(
+        res.status,
+        "invalid_response",
+        `Marketplace returned an unexpected response shape: ${result.error.message}`
+      )
+    }
+    return result.data
+  }
+
+  async function postJson<T>(
+    path: string,
+    body: unknown,
+    schema: z.ZodType<T>,
+    token?: string
+  ): Promise<T> {
     const res = await doFetch(`${base}${path}`, {
       method: "POST",
       headers: {
@@ -73,18 +97,18 @@ export function createMarketplaceClient(options: ClientOptions): MarketplaceClie
       body: JSON.stringify(body),
     })
     if (!res.ok) return readError(res)
-    return (await res.json()) as T
+    return parse(res, schema, await res.json())
   }
 
   return {
     async deviceStart() {
       const res = await doFetch(`${base}/auth/device/start`, { method: "POST" })
       if (!res.ok) return readError(res)
-      return (await res.json()) as DeviceCodeStartResponse
+      return parse(res, deviceCodeStartResponseSchema, await res.json())
     },
 
     devicePoll(deviceCode: string) {
-      return postJson<DeviceCodePollResponse>("/auth/device/poll", { deviceCode })
+      return postJson("/auth/device/poll", { deviceCode }, deviceCodePollResponseSchema)
     },
 
     async session(token: string) {
@@ -92,7 +116,7 @@ export function createMarketplaceClient(options: ClientOptions): MarketplaceClie
         headers: { authorization: `Bearer ${token}` },
       })
       if (!res.ok) return readError(res)
-      return (await res.json()) as SessionResponse
+      return parse(res, sessionResponseSchema, await res.json())
     },
 
     async publish(token, meta, pkg, filename) {
@@ -105,7 +129,7 @@ export function createMarketplaceClient(options: ClientOptions): MarketplaceClie
         body: form,
       })
       if (!res.ok) return readError(res)
-      return (await res.json()) as PublishResponse
+      return parse(res, publishResponseSchema, await res.json())
     },
   }
 }

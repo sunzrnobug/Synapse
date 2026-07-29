@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 import type { AccountDeps, CommandIo } from "./account-commands"
 import type { BuildResult } from "./build"
-import { spawn } from "node:child_process"
+import { Buffer } from "node:buffer"
 import * as path from "node:path"
 import process from "node:process"
 import { ManifestValidationError } from "@synapsepkg/plugin-manifest"
+import open from "open"
 import { runLogin, runLogout, runPublish, runWhoami } from "./account-commands"
 import { buildPlugin, PluginBuildError } from "./build"
 import { fileCredentialStore } from "./credentials-store"
@@ -31,8 +32,8 @@ Usage:
   synapse-plugin unlink   [dir] [--data-dir <dir>]
   synapse-plugin login    [--server <url>]
   synapse-plugin logout   [--server <url>]
-  synapse-plugin whoami   [--server <url>]
-  synapse-plugin publish  [dir] [--public] [--server <url>]
+  synapse-plugin whoami   [--server <url>] [--token-stdin]
+  synapse-plugin publish  [dir] [--public] [--server <url>] [--token-stdin]
 
 Commands:
   build      Bundle the plugin and write an installable <id>-<version>.syn
@@ -47,6 +48,13 @@ Commands:
 
 Environment:
   SYNAPSE_MARKETPLACE_URL   Marketplace server URL (default ${DEFAULT_SERVER})
+  SYNAPSE_TOKEN             Marketplace session token, used instead of persistent login
+  SYNAPSE_SECRET_TOOL_PATH  Linux only: explicit path to secret-tool, if not at a standard location
+
+Token resolution order for whoami/publish: --token-stdin > SYNAPSE_TOKEN > the
+persisted login from \`synapse-plugin login\` (stored via a system credential
+helper — macOS Keychain, Windows DPAPI, or Linux Secret Service; persistent
+login isn't available where none of these is present).
 `
 
 async function main(argv: string[]): Promise<void> {
@@ -82,17 +90,17 @@ async function main(argv: string[]): Promise<void> {
       return
     }
     case "login":
-      await runLogin(accountDeps(args))
+      await runLogin(await accountDeps(args))
       return
     case "logout":
-      await runLogout(accountDeps(args))
+      await runLogout(await accountDeps(args))
       return
     case "whoami":
-      await runWhoami(accountDeps(args))
+      await runWhoami(await accountDeps(args))
       return
     case "publish":
       await runPublish({
-        ...accountDeps(args),
+        ...(await accountDeps(args)),
         projectDir,
         visibility: args.flags.get("public") ? "public" : "private",
         build: cliBuild,
@@ -107,14 +115,25 @@ function resolveBaseUrl(args: ParsedArgs): string {
   return str(args.flags.get("server")) ?? process.env.SYNAPSE_MARKETPLACE_URL ?? DEFAULT_SERVER
 }
 
-function accountDeps(args: ParsedArgs): AccountDeps {
+async function accountDeps(args: ParsedArgs): Promise<AccountDeps> {
   const baseUrl = resolveBaseUrl(args)
   return {
     client: createMarketplaceClient({ baseUrl }),
     store: fileCredentialStore(),
     baseUrl,
     io: realIo(),
+    token: args.flags.get("token-stdin") ? (await readStdin()).trim() : undefined,
   }
+}
+
+/** Reads all of stdin as UTF-8 — used for `--token-stdin` so a token never
+ *  needs to appear as a command argument or in shell history. */
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = []
+  for await (const chunk of process.stdin) {
+    chunks.push(chunk as Buffer)
+  }
+  return Buffer.concat(chunks).toString("utf-8")
 }
 
 function realIo(): CommandIo {
@@ -126,16 +145,16 @@ function realIo(): CommandIo {
   }
 }
 
-function openBrowser(url: string): void {
-  const platform = process.platform
-  const [cmd, cmdArgs] =
-    platform === "win32"
-      ? (["cmd", ["/c", "start", "", url]] as const)
-      : platform === "darwin"
-        ? (["open", [url]] as const)
-        : (["xdg-open", [url]] as const)
+/** Opens a url in the OS default browser via the cross-platform `open`
+ *  package, never through a shell. The previous implementation shelled out
+ *  to `cmd /c start "" <url>` on Windows, and `cmd.exe`'s `start` builtin
+ *  re-parses `&`/`|` in its argument as its own command separators — a
+ *  command-injection path for a url that ultimately comes from the
+ *  marketplace's `verificationUri` response (schema-validated, but this is
+ *  the second, structural layer of defense: no shell in the loop at all). */
+export async function openBrowser(url: string): Promise<void> {
   try {
-    spawn(cmd, [...cmdArgs], { stdio: "ignore", detached: true }).unref()
+    await open(url)
   } catch {
     // best-effort; the user can open the URL manually
   }

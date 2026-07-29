@@ -33,6 +33,7 @@ import type { MigrationMarker } from "./grant-migration"
 import type { MarketplaceApi } from "./marketplace-api"
 import type { MarketplaceEntry } from "./marketplace-registry"
 import type { PluginBridgeAdapters, PluginRuntimeSnapshot } from "./plugin-bridge"
+import type { ChildProcessHandle } from "./plugin-process-host"
 import type { TimerAdapter } from "./timer-adapter"
 import type { PendingTriggerCapability } from "./trigger-grants"
 import type { TriggerInstanceRecord } from "./trigger-instance-store"
@@ -129,6 +130,23 @@ export interface PluginHostOptions {
   fsWatchAdapter?: import("./fs-watch-adapter").FsWatchAdapter
   /** Test seam: inject a fake hotkey adapter (no real globalShortcut). */
   hotkeyAdapter?: import("./hotkey-adapter").HotkeyAdapter
+  /** Test seam: replace the sandbox's real `utilityProcess.fork()`-backed
+   *  child spawner (Critical #1) — e.g. with
+   *  `createInProcessPluginFork()` so tests can run real plugin code without
+   *  forking an actual OS process. */
+  sandboxForkProcess?: (entryScriptPath: string, pluginId: string) => ChildProcessHandle
+  /**
+   * Absolute path to the built `plugin-runtime-entry.js` script. Must be
+   * computed by the caller from ITS OWN `__dirname` (`src/main/index.ts`'s
+   * `initPluginHost()` and `src/main/mcp/stdio-entry.ts` both do this) —
+   * `PluginSandbox`'s own `__dirname`-based default is only correct when the
+   * module ends up in the same Rollup chunk as the real entry point, which
+   * is not guaranteed once code is shared across multiple main-process
+   * entries (`index.js`/`mcp-stdio.js`); a shared chunk's `__dirname` is the
+   * chunk's own folder, not `out/main/`. Omitted only in tests, which always
+   * override `sandboxForkProcess` and never actually dereference this path.
+   */
+  sandboxEntryScriptPath?: string
   /** Accelerators reserved by the host (for example the launcher shortcut). */
   reservedAccelerators?: () => readonly string[]
   /** Supplies the currently selected chat provider/model for trigger-woken agents. */
@@ -338,7 +356,11 @@ export class PluginHost {
       invoker: this.invoker,
     })
     readClipboardForHost = () => this.bridge.readClipboardForHost()
-    this.sandbox = new PluginSandbox({ bridge: this.bridge })
+    this.sandbox = new PluginSandbox({
+      bridge: this.bridge,
+      forkProcess: options.sandboxForkProcess,
+      entryScriptPath: options.sandboxEntryScriptPath,
+    })
     this.registry = new PluginRegistry({ sandbox: this.sandbox })
     this.tools = new PluginToolBridge({ registry: this.registry })
     this.registry.on("changed", this.handleRegistryChanged)
@@ -955,6 +977,11 @@ export class PluginHost {
     if (!entry) return
 
     if (entry.source.kind === "dev") {
+      if (entry.status === "active") {
+        await this.registry.setEnabled(pluginId, false)
+      }
+      await this.disconnectAllCredentials(entry)
+      await this.grants.purgeAllForPluginId(pluginId)
       await removeDevPluginReference(this.devFilePath, entry.rootDir)
       await this.reload()
       return
@@ -973,6 +1000,14 @@ export class PluginHost {
     if (entry.status === "active") {
       await this.registry.setEnabled(pluginId, false)
     }
+    await this.disconnectAllCredentials(entry)
+    // purgeAllForPluginId (not just this manifest's current GrantIdentity)
+    // clears grants recorded under ANY historical identity for this
+    // pluginId — an older version's declaration hash, or a dev build's —
+    // not just the one currently installed. Reinstalling (or downgrading
+    // to) any of those would otherwise reconstruct an identity the store
+    // still remembers as granted, restoring it with no re-consent.
+    await this.grants.purgeAllForPluginId(pluginId)
     this.bridge.clearPluginData(pluginId)
     await removeDirectoryInside(entry.rootDir, this.userDir)
     await this.preferences.delete(pluginId)
@@ -981,6 +1016,24 @@ export class PluginHost {
       path.join(this.options.userDataDir, "plugin-data")
     )
     await this.reload()
+  }
+
+  /** Disconnects every credential declared by the currently-installed
+   *  manifest, for a plugin being fully removed. Only needs the current
+   *  manifest (unlike grants): the credential vault keys its storage slot by
+   *  `pluginId:credentialId` alone, not by the full identity, so `disconnect()`
+   *  already reaches whatever is stored there regardless of which identity
+   *  originally connected it. */
+  private async disconnectAllCredentials(entry: PluginRegistryEntry): Promise<void> {
+    if (!entry.manifest) return
+    for (const cred of entry.manifest.contributes.credentials ?? []) {
+      await this.credentialBroker.disconnect(
+        entry.pluginId,
+        entry.manifest,
+        entry.source.kind,
+        cred.id
+      )
+    }
   }
 
   async reload(pluginId?: string): Promise<PluginRegistryEntry | undefined> {

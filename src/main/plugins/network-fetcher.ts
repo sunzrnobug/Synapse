@@ -773,6 +773,29 @@ export function armHeadersDeadline(
 }
 
 /**
+ * Builds the Agent's `lookup` callback that pins every connection to the one
+ * already-validated address, for both call shapes Node's own connect logic
+ * may use.
+ *
+ * A literal-IP URL never reaches this at all (net.isIP short-circuits before
+ * any lookup call), but a real hostname does — and since Node 18.13,
+ * connecting to a hostname (not a literal IP) goes through
+ * lookupAndConnectMultiple by default (autoSelectFamily/Happy Eyeballs),
+ * which invokes `lookup` with `{ all: true }` and expects the callback as
+ * `(err, addresses[])`, not the classic `(err, address, family)`. Answering
+ * only the classic form regardless of `options.all` throws
+ * ERR_INVALID_IP_ADDRESS deep in node:net once Node tries to read the
+ * addresses array that was never given.
+ */
+function pinnedLookup(pinnedAddress: ResolvedAddress): NonNullable<https.AgentOptions["lookup"]> {
+  return (_hostname, options, callback) => {
+    if (options.all)
+      callback(null, [{ address: pinnedAddress.address, family: pinnedAddress.family }])
+    else callback(null, pinnedAddress.address, pinnedAddress.family)
+  }
+}
+
+/**
  * Default production transport over node:https.
  *
  * DNS PIN (the core SSRF / rebinding guard): the custom `lookup` callback on the
@@ -791,10 +814,7 @@ export function defaultTransport(args: TransportArgs): Promise<TransportResult> 
 
     const agent = new https.Agent({
       // Pin every connection for this request to the validated address.
-      lookup: (_hostname, _options, callback) => {
-        // callback(err, address, family)
-        callback(null, args.pinnedAddress.address, args.pinnedAddress.family)
-      },
+      lookup: pinnedLookup(args.pinnedAddress),
       ...(args.trustedCaPem ? { ca: args.trustedCaPem } : {}),
     })
 
@@ -900,9 +920,7 @@ export function defaultStreamTransport(args: TransportArgs): Promise<StreamTrans
     }
 
     const agent = new https.Agent({
-      lookup: (_hostname, _options, callback) => {
-        callback(null, args.pinnedAddress.address, args.pinnedAddress.family)
-      },
+      lookup: pinnedLookup(args.pinnedAddress),
       ...(args.trustedCaPem ? { ca: args.trustedCaPem } : {}),
     })
 

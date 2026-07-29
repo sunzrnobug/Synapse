@@ -42,6 +42,7 @@ describe("host-resource approval, end to end through the real transport", () => 
     const server = await startHeadlessApprovalServer({
       approveCapability: async () => ({ allow: false }), // unused in this test — proves the dispatch didn't cross kinds
       approveHostResource: service.hostResourceApprover,
+      promptForGrant: async () => ({ allow: false }),
       portFilePath,
     })
 
@@ -77,6 +78,7 @@ describe("host-resource approval, end to end through the real transport", () => 
     const server = await startHeadlessApprovalServer({
       approveCapability: async () => ({ allow: true }),
       approveHostResource: service.hostResourceApprover,
+      promptForGrant: async () => ({ allow: false }),
       portFilePath,
     })
 
@@ -106,6 +108,7 @@ describe("host-resource approval, end to end through the real transport", () => 
     const server = await startHeadlessApprovalServer({
       approveCapability: async () => ({ allow: true }),
       approveHostResource: service.hostResourceApprover,
+      promptForGrant: async () => ({ allow: false }),
       portFilePath,
     })
 

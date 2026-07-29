@@ -18,6 +18,7 @@ import { AgentRunStore } from "../ai/runs/agent-run-store"
 import { modelToolName } from "../ai/tool-registry"
 import { createHeadlessHotkeyAdapter } from "./headless-trigger-adapters"
 import { PluginHost } from "./plugin-host"
+import { createInProcessPluginFork } from "./test-support/in-process-plugin-fork"
 
 let dir: string
 let home: string
@@ -153,6 +154,7 @@ describe("downloadsOrganizer", () => {
       fsWatchAdapter,
       storageFlushMs: 0,
       workspaceRoots: { listForWorkspace: async () => [] },
+      sandboxForkProcess: createInProcessPluginFork(),
       ...support,
       backgroundAgentProvider: async () => ({ provider, model: "fake-model" }),
       capabilityGovernance: {

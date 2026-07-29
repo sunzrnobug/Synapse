@@ -1,6 +1,6 @@
-/* eslint-disable react/naming-convention-context-name */
-import type { PluginModule, ToolResult, View } from "@synapse/plugin-sdk"
+import type { ToolResult, View } from "@synapse/plugin-sdk"
 import type { PluginBridge } from "./plugin-bridge"
+import type { ChildProcessHandle } from "./plugin-process-host"
 import type {
   DiscoveredPlugin,
   PluginEventRequest,
@@ -9,33 +9,20 @@ import type {
   PluginToolInvokeRequest,
   PluginTriggerDispatch,
 } from "./types"
-import { promises as fs } from "node:fs"
 import * as path from "node:path"
-import vm from "node:vm"
-import { boundNonStreamingToolResult } from "../ai/tool-result-boundary"
-import { logger } from "../logging"
-import { CapabilityDenied } from "./capability-gate"
-import { PermissionDenied } from "./permissions"
-import { commandInvocation } from "./types"
+import { utilityProcess } from "electron"
+import {
+  PluginCallCancelledError,
+  PluginInvocationTimeoutError,
+  PluginProcessHost,
+  PluginSandboxError,
+} from "./plugin-process-host"
 
-type TimerCallback = (...args: unknown[]) => void
-type SandboxHookPhase = PluginInvokeRequest["phase"] | "dispose"
-type SandboxEventPhase = "onClipboardChange"
-
-export class PluginSandboxError extends Error {
-  constructor(message: string) {
-    super(message)
-    this.name = "PluginSandboxError"
-  }
-}
-
-/** Command/tool hook exceeded its wall-clock budget (not a plugin defect). */
-export class PluginInvocationTimeoutError extends PluginSandboxError {
-  constructor(message: string) {
-    super(message)
-    this.name = "PluginInvocationTimeoutError"
-  }
-}
+// Re-exported so every existing `import { PluginSandboxError } from
+// "./plugin-sandbox"` (and `instanceof` check against it) keeps working
+// unchanged — these classes now live in plugin-process-host.ts, the new
+// canonical home for sandbox errors.
+export { PluginCallCancelledError, PluginInvocationTimeoutError, PluginSandboxError }
 
 export interface PluginSandboxOptions {
   bridge: PluginBridge
@@ -48,816 +35,106 @@ export interface PluginSandboxOptions {
   commandRunTimeoutMs?: number
   /** Tools may run longer than UI command hooks; defaults to 30s. */
   toolInvokeTimeoutMs?: number
-}
-
-interface LoadedPlugin extends PluginSandboxModule {
-  sandboxVm: vm.Context
-  timers: Set<ReturnType<typeof setTimeout>>
-  intervals: Set<ReturnType<typeof setInterval>>
-  capabilityAbort: AbortController
-}
-
-interface CommonJSModule {
-  exports: unknown
-}
-
-interface SandboxHookRequest {
-  commandId: string
-  phase: SandboxHookPhase
-  invocation?: unknown
-  searchText?: string
-  actionId?: string
-  actionPayload?: unknown
-}
-
-interface SandboxEventHookRequest {
-  phase: SandboxEventPhase
-  eventPayload?: unknown
-}
-
-const invokeRequestKey = "__synapseInvokeRequest"
-const invokeContextKey = "__synapseInvokeContext"
-const invokeHookScript = `
-(() => {
-  const request = globalThis.${invokeRequestKey}
-  const ctx = globalThis.${invokeContextKey}
-  const handler = module.exports.commands[request.commandId]
-  if (request.phase === "run") return handler.run(request.invocation, ctx)
-  if (request.phase === "onSearchChange") return handler.onSearchChange(request.searchText, ctx)
-  if (request.phase === "onAction") return handler.onAction(request.actionId, request.actionPayload, ctx)
-  return handler.dispose(ctx)
-})()
-`
-
-const eventRequestKey = "__synapseEventRequest"
-const eventContextKey = "__synapseEventContext"
-const eventHookScript = `
-(() => {
-  const request = globalThis.${eventRequestKey}
-  const ctx = globalThis.${eventContextKey}
-  if (request.phase === "onClipboardChange") {
-    const handler = module.exports.events && module.exports.events.onClipboardChange
-    if (!handler) return undefined
-    return handler(request.eventPayload, ctx)
-  }
-  return undefined
-})()
-`
-
-const toolRequestKey = "__synapseToolRequest"
-const toolContextKey = "__synapseToolContext"
-const toolResultKey = "__synapseToolResult"
-const toolHookScript = `
-(() => {
-  const request = globalThis.${toolRequestKey}
-  const ctx = globalThis.${toolContextKey}
-  const handler = module.exports.tools[request.toolName]
-  return handler(request.input, ctx)
-})()
-`
-
-// A plugin can return an accessor or Proxy as its ToolResult. Inspecting that
-// object from the host would execute plugin code after the VM timeout has
-// ended. This second, synchronous VM script clones descriptor-backed data
-// before the object crosses the boundary, so proxy traps remain subject to
-// the same timeout as the hook itself.
-const toolResultSanitizerScript = `
-(() => {
-  const value = globalThis.${toolResultKey}
-  const maxNodes = 10000
-  const maxBlocks = 1024
-  let nodes = 0
-  const seen = new WeakSet()
-  const fail = (message) => { throw new Error(message) }
-  const ownConstructorName = (prototype) => {
-    const descriptor = Object.getOwnPropertyDescriptor(prototype, "constructor")
-    return descriptor && "value" in descriptor && typeof descriptor.value === "function"
-      ? descriptor.value.name
-      : undefined
-  }
-  const plain = (item) => {
-    if (!item || typeof item !== "object") return false
-    const prototype = Object.getPrototypeOf(item)
-    if (Array.isArray(item)) {
-      const parent = prototype && Object.getPrototypeOf(prototype)
-      if (
-        !prototype ||
-        ownConstructorName(prototype) !== "Array" ||
-        !parent ||
-        ownConstructorName(parent) !== "Object" ||
-        Object.getPrototypeOf(parent) !== null
-      ) return false
-    } else if (
-      prototype !== null &&
-      (ownConstructorName(prototype) !== "Object" || Object.getPrototypeOf(prototype) !== null)
-    ) return false
-    for (let current = item; current; current = Object.getPrototypeOf(current)) {
-      if (Object.getOwnPropertyDescriptor(current, "toJSON")) return false
-    }
-    return true
-  }
-  const data = (item, key, required = true) => {
-    if (!plain(item)) fail("Plugin tool result contains a non-plain object")
-    const descriptor = Object.getOwnPropertyDescriptor(item, key)
-    if (!descriptor) {
-      if (required) fail("Plugin tool result is missing " + key)
-      return undefined
-    }
-    if (!("value" in descriptor)) fail("Plugin tool result property " + key + " must be data")
-    return descriptor.value
-  }
-  const cloneJson = (item, depth = 0) => {
-    nodes += 1
-    if (depth > 32 || nodes > maxNodes) fail("Plugin tool result JSON is too complex")
-    if (item === undefined || item === null || typeof item === "boolean" || typeof item === "string") return item
-    if (typeof item === "number") {
-      if (!Number.isFinite(item)) fail("Plugin tool result JSON contains a non-finite number")
-      return item
-    }
-    if (typeof item !== "object" || !plain(item) || seen.has(item)) {
-      fail("Plugin tool result JSON must be plain, acyclic data")
-    }
-    seen.add(item)
-    if (Array.isArray(item)) {
-      const length = data(item, "length")
-      if (!Number.isSafeInteger(length) || length < 0 || length > maxNodes) {
-        fail("Plugin tool result JSON array is too large")
-      }
-      const output = []
-      for (let index = 0; index < length; index += 1) {
-        const descriptor = Object.getOwnPropertyDescriptor(item, String(index))
-        if (!descriptor) output.push(null)
-        else {
-          if (!("value" in descriptor)) fail("Plugin tool result JSON contains an accessor")
-          output.push(cloneJson(descriptor.value, depth + 1))
-        }
-      }
-      return output
-    }
-    const output = {}
-    let properties = 0
-    for (const key in item) {
-      properties += 1
-      if (properties > maxNodes) fail("Plugin tool result JSON object is too large")
-      const descriptor = Object.getOwnPropertyDescriptor(item, key)
-      if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
-        fail("Plugin tool result JSON contains an accessor")
-      }
-      Object.defineProperty(output, key, {
-        value: cloneJson(descriptor.value, depth + 1),
-        enumerable: true,
-        configurable: true,
-        writable: true,
-      })
-    }
-    return output
-  }
-  const cloneBlock = (block) => {
-    const type = data(block, "type")
-    if (typeof type !== "string") fail("Plugin tool result content blocks must have a string type")
-    if (type === "text") {
-      const text = data(block, "text")
-      if (typeof text !== "string") fail("Plugin text tool result must have string text")
-      return { type, text }
-    }
-    if (type === "json") return { type, json: cloneJson(data(block, "json")) }
-    if (type === "image") {
-      const path = data(block, "path")
-      const mimeType = data(block, "mimeType")
-      if (typeof path !== "string" || typeof mimeType !== "string") {
-        fail("Plugin image tool result must have string path and mimeType")
-      }
-      return { type, path, mimeType }
-    }
-    fail("Plugin tool result content block type is unsupported")
-  }
-  if (!plain(value)) fail("Plugin tool must return a plain ToolResult object")
-  const content = data(value, "content")
-  if (!Array.isArray(content) || !plain(content)) {
-    fail("Plugin tool result must include a plain content array")
-  }
-  const length = data(content, "length")
-  if (!Number.isSafeInteger(length) || length < 0 || length > maxBlocks) {
-    fail("Plugin tool result has too many content blocks")
-  }
-  const output = { content: [] }
-  for (let index = 0; index < length; index += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(content, String(index))
-    if (!descriptor || !("value" in descriptor)) {
-      fail("Plugin tool result content contains an accessor")
-    }
-    output.content.push(cloneBlock(descriptor.value))
-  }
-  const isError = Object.getOwnPropertyDescriptor(value, "isError")
-  if (isError) {
-    if (!("value" in isError) || typeof isError.value !== "boolean") {
-      fail("Plugin tool result isError must be boolean data")
-    }
-    output.isError = isError.value
-  }
-  const structured = Object.getOwnPropertyDescriptor(value, "structured")
-  if (structured) {
-    if (!("value" in structured)) fail("Plugin tool result structured must be data")
-    output.structured = cloneJson(structured.value)
-  }
-  return output
-})()
-`
-
-// Compiled once: the hook body has no per-call literals (it reads the
-// request/ctx from injected globals), so the same Script is reused across
-// every invoke. onSearchChange fires on every keystroke, so avoiding a
-// recompile per call is a real saving.
-const compiledInvokeHookScript = new vm.Script(invokeHookScript, {
-  filename: "synapse-plugin:invoke-hook",
-})
-
-const compiledEventHookScript = new vm.Script(eventHookScript, {
-  filename: "synapse-plugin:event-hook",
-})
-
-const compiledToolHookScript = new vm.Script(toolHookScript, {
-  filename: "synapse-plugin:tool-hook",
-})
-
-const compiledToolResultSanitizerScript = new vm.Script(toolResultSanitizerScript, {
-  filename: "synapse-plugin:tool-result-boundary",
-})
-
-// P0 isolation is a lightweight compatibility boundary. node:vm lets the host
-// curate globals and enforce timeouts, but it is not a strong security sandbox.
-export class PluginSandbox {
-  private readonly loaded = new Map<string, LoadedPlugin>()
-  private readonly loadTimeoutMs: number
-  private readonly invokeTimeoutMs: number
-  private readonly commandRunTimeoutMs: number
-  private readonly toolInvokeTimeoutMs: number
-
-  constructor(private readonly options: PluginSandboxOptions) {
-    this.loadTimeoutMs = options.loadTimeoutMs ?? 5_000
-    this.invokeTimeoutMs = options.invokeTimeoutMs ?? 5_000
-    this.commandRunTimeoutMs = options.commandRunTimeoutMs ?? 120_000
-    this.toolInvokeTimeoutMs = options.toolInvokeTimeoutMs ?? 30_000
-  }
-
-  async loadPlugin(entry: DiscoveredPlugin): Promise<PluginSandboxModule> {
-    if (entry.status !== "valid" || !entry.manifest) {
-      throw new PluginSandboxError(`Cannot load plugin with status ${entry.status}`)
-    }
-
-    await this.unloadPlugin(entry.pluginId)
-
-    const mainPath = resolveInside(entry.rootDir, entry.manifest.main)
-    const code = await fs.readFile(mainPath, "utf-8")
-    const moduleObject: CommonJSModule = { exports: {} }
-    const runtime = this.options.bridge.createContext(entry.pluginId, entry.manifest, {
-      source: "runless",
-      actor: "user",
-      trigger: "plugin:load",
-    })
-    const timers = new Set<ReturnType<typeof setTimeout>>()
-    const intervals = new Set<ReturnType<typeof setInterval>>()
-    const sandboxVm = vm.createContext(
-      {
-        ...createSandboxGlobals(entry.pluginId, timers, intervals),
-        module: moduleObject,
-        exports: moduleObject.exports,
-        synapse: runtime,
-      },
-      {
-        name: `synapse-plugin:${entry.pluginId}`,
-      }
-    )
-    const script = new vm.Script(
-      `(function (module, exports, synapse) {\n${code}\n})(module, exports, synapse)`,
-      {
-        filename: mainPath,
-      }
-    )
-    script.runInContext(sandboxVm, { timeout: this.loadTimeoutMs })
-
-    const pluginModule = normalizePluginModule(moduleObject.exports)
-    const loaded: LoadedPlugin = {
-      pluginId: entry.pluginId,
-      manifest: entry.manifest,
-      module: pluginModule,
-      sandboxVm,
-      timers,
-      intervals,
-      capabilityAbort: new AbortController(),
-    }
-    this.loaded.set(entry.pluginId, loaded)
-    return loaded
-  }
-
-  async unloadPlugin(pluginId: string): Promise<void> {
-    const plugin = this.loaded.get(pluginId)
-    if (!plugin) return
-
-    for (const commandId of Object.keys(plugin.module.commands)) {
-      await this.disposeCommand(pluginId, commandId)
-    }
-    for (const timer of plugin.timers) clearTimeout(timer)
-    for (const interval of plugin.intervals) clearInterval(interval)
-    plugin.timers.clear()
-    plugin.intervals.clear()
-    this.loaded.delete(pluginId)
-    await this.options.bridge.disposePlugin(pluginId)
-  }
-
-  async invokeCommand(request: PluginInvokeRequest): Promise<View | void> {
-    const plugin = this.loaded.get(request.pluginId)
-    if (!plugin) throw new PluginSandboxError(`Plugin is not loaded: ${request.pluginId}`)
-
-    const handler = plugin.module.commands[request.commandId]
-    if (!handler) {
-      throw new PluginSandboxError(`Plugin command is not exported: ${request.commandId}`)
-    }
-
-    const pluginCtx = this.options.bridge.createContext(request.pluginId, plugin.manifest, {
-      source: "runless",
-      actor: "user",
-      trigger: `command:${request.commandId}`,
-      signal: plugin.capabilityAbort.signal,
-    })
-    if (request.phase === "run") {
-      return this.withTimeout(
-        this.runHookInContext(
-          plugin,
-          {
-            commandId: request.commandId,
-            phase: "run",
-            invocation: commandInvocation(request.commandId, request.payload),
-          },
-          pluginCtx
-        ),
-        this.commandRunTimeoutMs
-      )
-    }
-    if (request.phase === "onSearchChange") {
-      if (!handler.onSearchChange) return undefined
-      return this.withTimeout(
-        this.runHookInContext(
-          plugin,
-          {
-            commandId: request.commandId,
-            phase: "onSearchChange",
-            searchText: String(request.payload ?? ""),
-          },
-          pluginCtx
-        )
-      )
-    }
-    if (!handler.onAction) return undefined
-    const action = normalizeActionPayload(request.payload)
-    return this.withTimeout(
-      this.runHookInContext(
-        plugin,
-        {
-          commandId: request.commandId,
-          phase: "onAction",
-          actionId: action.actionId,
-          actionPayload: action.payload,
-        },
-        pluginCtx
-      )
-    )
-  }
-
-  async invokeTool(request: PluginToolInvokeRequest): Promise<ToolResult> {
-    const plugin = this.loaded.get(request.pluginId)
-    if (!plugin) throw new PluginSandboxError(`Plugin is not loaded: ${request.pluginId}`)
-
-    const handler = plugin.module.tools?.[request.toolName]
-    if (typeof handler !== "function") {
-      throw new PluginSandboxError(`Plugin tool is not exported: ${request.toolName}`)
-    }
-
-    // A per-call controller fires on timeout; it is linked with the caller's
-    // signal so either source cancels the running tool.
-    const controller = new AbortController()
-    const signal = linkAbortSignals(
-      controller.signal,
-      linkAbortSignals(plugin.capabilityAbort.signal, request.options.signal)
-    )
-    const deadlineAt = Date.now() + this.toolInvokeTimeoutMs
-    const timer = setTimeout(() => {
-      controller.abort(new PluginSandboxError(`Plugin tool exceeded ${this.toolInvokeTimeoutMs}ms`))
-    }, this.toolInvokeTimeoutMs)
-
-    const toolCtx = this.options.bridge.createToolContext(request.pluginId, plugin.manifest, {
-      caller: request.options.caller,
-      signal,
-      progress: request.options.progress,
-      capabilities: request.capabilities,
-      toolName: request.toolName,
-    })
-
-    try {
-      const rawResult = await Promise.race([
-        Promise.resolve(
-          this.runToolHookInContext(
-            plugin,
-            { toolName: request.toolName, input: request.input },
-            toolCtx
-          )
-        ),
-        rejectWhenAborted(signal),
-      ])
-      // Clone in the plugin VM first so proxy/accessor traps stay within its
-      // synchronous timeout. The shared host boundary then takes its own
-      // descriptor-safe clone and applies the ingress cap before anything can
-      // reach registry/model/checkpoint code.
-      const validationTimeoutMs = deadlineAt - Date.now()
-      if (validationTimeoutMs <= 0) {
-        throw new PluginSandboxError(`Plugin tool exceeded ${this.toolInvokeTimeoutMs}ms`)
-      }
-      return boundNonStreamingToolResult(
-        this.cloneToolResultInContext(plugin, rawResult, validationTimeoutMs)
-      )
-    } catch (err) {
-      // Infrastructure (timeout/cancel/bad-shape) and policy (permission)
-      // errors propagate; a fault inside the handler is surfaced to the model
-      // as an error result rather than throwing — see ToolHandler docs.
-      if (
-        err instanceof PluginSandboxError ||
-        err instanceof PermissionDenied ||
-        err instanceof CapabilityDenied
-      )
-        throw err
-      return {
-        content: [{ type: "text", text: errorMessage(err) }],
-        isError: true,
-      }
-    } finally {
-      clearTimeout(timer)
-    }
-  }
-
-  async disposeCommand(pluginId: string, commandId: string): Promise<void> {
-    const plugin = this.loaded.get(pluginId)
-    const handler = plugin?.module.commands[commandId]
-    if (!plugin || !handler?.dispose) return
-    const pluginCtx = this.options.bridge.createContext(pluginId, plugin.manifest, {
-      source: "runless",
-      actor: "user",
-      trigger: `command:${commandId}:dispose`,
-    })
-    await this.withTimeout(
-      this.runHookInContext(plugin, { commandId, phase: "dispose" }, pluginCtx)
-    )
-  }
-
-  async dispatchEvent(request: PluginEventRequest): Promise<void> {
-    const plugin = this.loaded.get(request.pluginId)
-    if (!plugin) throw new PluginSandboxError(`Plugin is not loaded: ${request.pluginId}`)
-    if (request.event === "clipboard:change" && !plugin.module.events?.onClipboardChange) return
-
-    const pluginCtx = this.options.bridge.createContext(request.pluginId, plugin.manifest, {
-      source: "runless",
-      actor: "background",
-      trigger: "clipboard:change",
-      signal: plugin.capabilityAbort.signal,
-    })
-    await this.withTimeout(
-      this.runEventHookInContext(
-        plugin,
-        {
-          phase: "onClipboardChange",
-          eventPayload: request.payload,
-        },
-        pluginCtx
-      )
-    )
-  }
-
-  async dispatchTrigger(request: PluginTriggerDispatch): Promise<void> {
-    const plugin = this.loaded.get(request.pluginId)
-    if (!plugin) throw new PluginSandboxError(`Plugin is not loaded: ${request.pluginId}`)
-
-    const exportName = request.handler.slice("triggers.".length)
-    const handler = plugin.module.triggers?.[exportName]
-    if (typeof handler !== "function") return
-
-    const pluginCtx = this.options.bridge.createContext(request.pluginId, plugin.manifest, {
-      source: "runless",
-      actor: "background",
-      trigger: request.trigger,
-      signal: request.signal,
-      invocationId: request.invocationId,
-    })
-    await this.withTimeout(Promise.resolve(handler(request.event, pluginCtx)))
-  }
-
-  getLoadedModule(pluginId: string): PluginSandboxModule | undefined {
-    const plugin = this.loaded.get(pluginId)
-    if (!plugin) return undefined
-    return { pluginId: plugin.pluginId, manifest: plugin.manifest, module: plugin.module }
-  }
-
   /**
-   * Abort background work for a loaded plugin after a capability revoke.
-   *
-   * **Intentionally plugin-wide, not capability-scoped:** the `capability`
-   * argument is reserved for future per-capability hooks; today revoke always:
-   * - aborts the plugin's shared `capabilityAbort` signal (cancels in-flight tools)
-   * - clears **all** sandbox `setTimeout` / `setInterval` handles for the plugin
-   *
-   * Rationale: sandbox timers are not tagged with a capability id; leaving them
-   * running after revoke risks re-arming revoked access. The trade-off is that
-   * revoking e.g. `clipboard:watch` also kills unrelated background intervals
-   * and elevated tool calls still in progress.
+   * Absolute path to the built `plugin-runtime-entry.js` script that
+   * `utilityProcess.fork()` loads. The default below (this module's own
+   * `__dirname`) is only correct if this module ends up bundled into the
+   * SAME Rollup chunk as an actual entry point — true when only one
+   * main-process entry uses it, but NOT guaranteed once code is shared
+   * across multiple entries (`index.js`/`mcp-stdio.js`), since a shared
+   * chunk's `__dirname` is the chunk's own folder under `out/main/chunks/`,
+   * not `out/main/`. Real callers (`src/main/index.ts`'s `initPluginHost()`,
+   * `src/main/mcp/stdio-entry.ts`) MUST compute this from their OWN
+   * `__dirname` and pass it explicitly (via `PluginHostOptions.
+   * sandboxEntryScriptPath`) rather than rely on this default — verified by
+   * building the app and confirming `entryScriptPath` did NOT resolve
+   * correctly through the shared chunk before that fix. Only test code
+   * (which always overrides `forkProcess` too, so this value is never
+   * actually dereferenced) may safely omit it.
    */
-  abortPluginCapability(pluginId: string, capability: string): void {
-    const plugin = this.loaded.get(pluginId)
-    if (!plugin) return
-    void capability // reserved for per-capability teardown in later specs
-
-    plugin.capabilityAbort.abort()
-    plugin.capabilityAbort = new AbortController()
-
-    for (const timer of plugin.timers) clearTimeout(timer)
-    for (const interval of plugin.intervals) clearInterval(interval)
-    plugin.timers.clear()
-    plugin.intervals.clear()
-  }
-
-  /** Test seam: counts timers/intervals the sandbox tracks for a loaded plugin. */
-  trackedWorkCounts(pluginId: string): { timers: number; intervals: number } {
-    const plugin = this.loaded.get(pluginId)
-    if (!plugin) return { timers: 0, intervals: 0 }
-    return { timers: plugin.timers.size, intervals: plugin.intervals.size }
-  }
-
-  private async withTimeout<T>(
-    value: Promise<T> | T,
-    timeoutMs = this.invokeTimeoutMs
-  ): Promise<T> {
-    let timer: ReturnType<typeof setTimeout> | undefined
-    try {
-      return await Promise.race([
-        Promise.resolve(value),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(
-            () => reject(new PluginInvocationTimeoutError(`Plugin call exceeded ${timeoutMs}ms`)),
-            timeoutMs
-          )
-        }),
-      ])
-    } finally {
-      if (timer) clearTimeout(timer)
-    }
-  }
-
-  private runHookInContext<T>(
-    plugin: LoadedPlugin,
-    request: SandboxHookRequest,
-    pluginCtx: unknown
-  ): Promise<T> | T {
-    const sandboxGlobals = plugin.sandboxVm as Record<string, unknown>
-    sandboxGlobals[invokeRequestKey] = request
-    sandboxGlobals[invokeContextKey] = pluginCtx
-    try {
-      return compiledInvokeHookScript.runInContext(plugin.sandboxVm, {
-        timeout: this.invokeTimeoutMs,
-      }) as Promise<T> | T
-    } catch (err) {
-      if (isVmTimeout(err)) {
-        // The vm's synchronous watchdog and withTimeout's async wall-clock
-        // watchdog describe the same public failure: a command hook exceeded
-        // its invocation budget. Keep the typed error stable regardless of
-        // which watchdog wins under CPU contention.
-        throw new PluginInvocationTimeoutError(`Plugin call exceeded ${this.invokeTimeoutMs}ms`)
-      }
-      throw err
-    } finally {
-      delete sandboxGlobals[invokeRequestKey]
-      delete sandboxGlobals[invokeContextKey]
-    }
-  }
-
-  private runEventHookInContext<T>(
-    plugin: LoadedPlugin,
-    request: SandboxEventHookRequest,
-    pluginCtx: unknown
-  ): Promise<T> | T {
-    const sandboxGlobals = plugin.sandboxVm as Record<string, unknown>
-    sandboxGlobals[eventRequestKey] = request
-    sandboxGlobals[eventContextKey] = pluginCtx
-    try {
-      return compiledEventHookScript.runInContext(plugin.sandboxVm, {
-        timeout: this.invokeTimeoutMs,
-      }) as Promise<T> | T
-    } catch (err) {
-      if (isVmTimeout(err)) {
-        throw new PluginSandboxError(`Plugin call exceeded ${this.invokeTimeoutMs}ms`)
-      }
-      throw err
-    } finally {
-      delete sandboxGlobals[eventRequestKey]
-      delete sandboxGlobals[eventContextKey]
-    }
-  }
-
-  private runToolHookInContext(
-    plugin: LoadedPlugin,
-    request: { toolName: string; input: unknown },
-    toolCtx: unknown
-  ): Promise<ToolResult> | ToolResult {
-    const sandboxGlobals = plugin.sandboxVm as Record<string, unknown>
-    sandboxGlobals[toolRequestKey] = request
-    sandboxGlobals[toolContextKey] = toolCtx
-    try {
-      // The vm timeout only bounds synchronous execution; the async portion is
-      // bounded by the AbortController/timeout in invokeTool.
-      return compiledToolHookScript.runInContext(plugin.sandboxVm, {
-        timeout: this.toolInvokeTimeoutMs,
-      }) as Promise<ToolResult> | ToolResult
-    } catch (err) {
-      if (isVmTimeout(err)) {
-        throw new PluginSandboxError(`Plugin tool exceeded ${this.toolInvokeTimeoutMs}ms`)
-      }
-      throw err
-    } finally {
-      delete sandboxGlobals[toolRequestKey]
-      delete sandboxGlobals[toolContextKey]
-    }
-  }
-
-  private cloneToolResultInContext(
-    plugin: LoadedPlugin,
-    result: unknown,
-    timeoutMs: number
-  ): ToolResult {
-    const sandboxGlobals = plugin.sandboxVm as Record<string, unknown>
-    sandboxGlobals[toolResultKey] = result
-    try {
-      return compiledToolResultSanitizerScript.runInContext(plugin.sandboxVm, {
-        timeout: timeoutMs,
-      }) as ToolResult
-    } catch (err) {
-      if (isVmTimeout(err)) {
-        throw new PluginSandboxError(`Plugin tool result validation exceeded ${timeoutMs}ms`)
-      }
-      throw new PluginSandboxError(
-        `Plugin tool result rejected at sandbox boundary: ${errorMessage(err)}`
-      )
-    } finally {
-      delete sandboxGlobals[toolResultKey]
-    }
-  }
-}
-
-function createSandboxGlobals(
-  pluginId: string,
-  timers: Set<ReturnType<typeof setTimeout>>,
-  intervals: Set<ReturnType<typeof setInterval>>
-): vm.Context {
-  return {
-    console: {
-      log: (...args: unknown[]) =>
-        logger.child(`plugin:${pluginId}`).info(args.map((arg) => String(arg)).join(" ")),
-      warn: (...args: unknown[]) =>
-        logger.child(`plugin:${pluginId}`).warn(args.map((arg) => String(arg)).join(" ")),
-      error: (...args: unknown[]) =>
-        logger.child(`plugin:${pluginId}`).error(args.map((arg) => String(arg)).join(" ")),
-    },
-    setTimeout: (handler: TimerCallback, timeout?: number, ...args: unknown[]) => {
-      const timer = setTimeout(handler, timeout, ...args)
-      timers.add(timer)
-      return timer
-    },
-    clearTimeout: (timer: ReturnType<typeof setTimeout>) => {
-      timers.delete(timer)
-      clearTimeout(timer)
-    },
-    setInterval: (handler: TimerCallback, timeout?: number, ...args: unknown[]) => {
-      const interval = setInterval(handler, timeout, ...args)
-      intervals.add(interval)
-      return interval
-    },
-    clearInterval: (interval: ReturnType<typeof setInterval>) => {
-      intervals.delete(interval)
-      clearInterval(interval)
-    },
-    URL,
-    TextEncoder,
-    TextDecoder,
-    atob: globalThis.atob,
-    btoa: globalThis.btoa,
-    structuredClone,
-    crypto: {
-      randomUUID: () => globalThis.crypto.randomUUID(),
-      getRandomValues: (array: Uint8Array) => globalThis.crypto.getRandomValues(array),
-    },
-  } as vm.Context
-}
-
-function normalizePluginModule(value: unknown): PluginModule {
-  if (!value || typeof value !== "object") {
-    throw new PluginSandboxError("Plugin entry must export an object")
-  }
-  const commands = (value as { commands?: unknown }).commands
-  if (!commands || typeof commands !== "object" || Array.isArray(commands)) {
-    throw new PluginSandboxError("Plugin entry must export a commands object")
-  }
-  for (const [commandId, handler] of Object.entries(commands)) {
-    if (
-      !handler ||
-      typeof handler !== "object" ||
-      typeof (handler as { run?: unknown }).run !== "function"
-    ) {
-      throw new PluginSandboxError(`Plugin command ${commandId} must export a run function`)
-    }
-  }
-  const tools = (value as { tools?: unknown }).tools
-  if (tools !== undefined) {
-    if (!tools || typeof tools !== "object" || Array.isArray(tools)) {
-      throw new PluginSandboxError("Plugin entry tools must be an object")
-    }
-    for (const [toolName, handler] of Object.entries(tools)) {
-      if (typeof handler !== "function") {
-        throw new PluginSandboxError(`Plugin tool ${toolName} must be a function`)
-      }
-    }
-  }
-  return value as PluginModule
+  entryScriptPath?: string
+  /** Test seam: replaces the real `utilityProcess.fork()`-backed factory. */
+  forkProcess?: (entryScriptPath: string, pluginId: string) => ChildProcessHandle
 }
 
 /**
- * Combine the per-call timeout signal with an optional caller signal so either
- * source can cancel the tool. Prefers the native `AbortSignal.any` and falls
- * back to manual wiring on older runtimes.
+ * Thin, stable-signature wrapper over `PluginProcessHost` (Critical #1,
+ * slice 4). Every actual process-isolation / capability-dispatch decision
+ * lives in plugin-process-host.ts — see its docs for the design. This class
+ * exists purely so `plugin-registry.ts`, `plugin-host.ts`,
+ * `plugin-tool-bridge.ts`, and `background-invoker.ts` never had to change a
+ * single call site across the `node:vm` → `utilityProcess` migration.
  */
-function linkAbortSignals(primary: AbortSignal, secondary?: AbortSignal): AbortSignal {
-  if (!secondary) return primary
-  if (typeof AbortSignal.any === "function") return AbortSignal.any([primary, secondary])
+export class PluginSandbox {
+  private readonly host: PluginProcessHost
 
-  const controller = new AbortController()
-  if (primary.aborted) controller.abort(primary.reason)
-  else if (secondary.aborted) controller.abort(secondary.reason)
-  else {
-    primary.addEventListener("abort", () => controller.abort(primary.reason), { once: true })
-    secondary.addEventListener("abort", () => controller.abort(secondary.reason), { once: true })
+  constructor(options: PluginSandboxOptions) {
+    this.host = new PluginProcessHost({
+      bridge: options.bridge,
+      loadTimeoutMs: options.loadTimeoutMs,
+      invokeTimeoutMs: options.invokeTimeoutMs,
+      commandRunTimeoutMs: options.commandRunTimeoutMs,
+      toolInvokeTimeoutMs: options.toolInvokeTimeoutMs,
+      entryScriptPath: options.entryScriptPath ?? path.join(__dirname, "plugin-runtime-entry.js"),
+      forkProcess: options.forkProcess ?? forkRealUtilityProcess,
+    })
   }
-  return controller.signal
+
+  loadPlugin(entry: DiscoveredPlugin): Promise<PluginSandboxModule> {
+    return this.host.loadPlugin(entry)
+  }
+
+  unloadPlugin(pluginId: string): Promise<void> {
+    return this.host.unloadPlugin(pluginId)
+  }
+
+  invokeCommand(request: PluginInvokeRequest): Promise<View | void> {
+    return this.host.invokeCommand(request)
+  }
+
+  invokeTool(request: PluginToolInvokeRequest): Promise<ToolResult> {
+    return this.host.invokeTool(request)
+  }
+
+  disposeCommand(pluginId: string, commandId: string): Promise<void> {
+    return this.host.disposeCommand(pluginId, commandId)
+  }
+
+  dispatchEvent(request: PluginEventRequest): Promise<void> {
+    return this.host.dispatchEvent(request)
+  }
+
+  dispatchTrigger(request: PluginTriggerDispatch): Promise<void> {
+    return this.host.dispatchTrigger(request)
+  }
+
+  getLoadedModule(pluginId: string): PluginSandboxModule | undefined {
+    return this.host.getLoadedModule(pluginId)
+  }
+
+  /**
+   * Revoke background work for a loaded plugin after a capability revoke.
+   * Kills and transparently reloads the plugin's child process — the only
+   * way to guarantee every timer/listener the plugin created is actually
+   * gone now that plugin code runs in a real OS process, not a `node:vm`
+   * context the host could reach into. See `PluginProcessHost.
+   * abortPluginCapability`'s docs for the full rationale.
+   */
+  abortPluginCapability(pluginId: string, capability: string): void {
+    this.host.abortPluginCapability(pluginId, capability)
+  }
 }
 
-function rejectWhenAborted(signal: AbortSignal): Promise<never> {
-  return new Promise((_, reject) => {
-    const fail = (): void => {
-      const reason = signal.reason
-      reject(reason instanceof Error ? reason : new PluginSandboxError("Plugin tool was cancelled"))
-    }
-    if (signal.aborted) fail()
-    else signal.addEventListener("abort", fail, { once: true })
+function forkRealUtilityProcess(entryScriptPath: string, pluginId: string): ChildProcessHandle {
+  const child = utilityProcess.fork(entryScriptPath, [], {
+    serviceName: `synapse-plugin:${pluginId}`,
   })
-}
-
-// Errors thrown inside the vm belong to a different realm, so `instanceof
-// Error` is unreliable here. Duck-type the message instead so the model sees
-// "nope" rather than "Error: nope".
-function errorMessage(err: unknown): string {
-  if (
-    err &&
-    typeof err === "object" &&
-    typeof (err as { message?: unknown }).message === "string"
-  ) {
-    return (err as { message: string }).message
-  }
-  return String(err)
-}
-
-function normalizeActionPayload(payload: unknown): { actionId: string; payload: unknown } {
-  if (
-    !payload ||
-    typeof payload !== "object" ||
-    typeof (payload as { actionId?: unknown }).actionId !== "string"
-  ) {
-    throw new PluginSandboxError("onAction payload must include an actionId")
-  }
   return {
-    actionId: (payload as { actionId: string }).actionId,
-    payload: (payload as { payload?: unknown }).payload,
+    postMessage: (message) => child.postMessage(message),
+    onMessage: (listener) => child.on("message", listener),
+    onExit: (listener) => child.on("exit", listener),
+    kill: () => {
+      child.kill()
+    },
   }
-}
-
-function resolveInside(rootDir: string, relativePath: string): string {
-  const root = path.resolve(rootDir)
-  const target = path.resolve(root, relativePath)
-  if (target !== root && !target.startsWith(`${root}${path.sep}`)) {
-    throw new PluginSandboxError("Plugin main path escapes the plugin directory")
-  }
-  return target
-}
-
-function isVmTimeout(err: unknown): boolean {
-  // node:vm reports a synchronous timeout with this fixed message; there is
-  // no error code to match on, so the string check is the documented signal.
-  return Boolean(
-    err &&
-    typeof err === "object" &&
-    typeof (err as { message?: unknown }).message === "string" &&
-    /Script execution timed out/.test((err as { message: string }).message)
-  )
 }

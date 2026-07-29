@@ -157,7 +157,11 @@ import { GrantStore, grantStoreFilePath } from "./plugins/grant-store"
 import { createHotkeyAdapter } from "./plugins/hotkey-adapter"
 import { createMarketplaceApi } from "./plugins/marketplace-api"
 import { PluginHost } from "./plugins/plugin-host"
-import { getContentType, resolveStaticPath } from "./protocol/resolve-static-path"
+import {
+  getContentType,
+  resolveSafePluginAssetPath,
+  resolveStaticPath,
+} from "./protocol/resolve-static-path"
 import {
   consumeSearchWindowTrayOpenSuppression,
   ensureSearchWindow,
@@ -170,6 +174,7 @@ import {
 import { settingsFilePath } from "./settings/settings"
 import {
   bindGlobalShortcut,
+  bindGlobalShortcutWithRetry,
   resumeGlobalShortcut,
   suspendGlobalShortcut,
   unbindGlobalShortcut,
@@ -211,6 +216,12 @@ const isMcpStdioMode = process.argv.includes("--mcp-stdio")
 const APP_SCHEME = "app"
 const APP_ORIGIN = `${APP_SCHEME}://app`
 
+// Serves a plugin's declared icon (manifest `icon` / command `icon`) from its
+// install directory, as `plugin-asset://<pluginId>/<relativeIconPath>`. Reuses
+// resolve-static-path's traversal check, rooted at that plugin's own rootDir
+// rather than the renderer output directory.
+const PLUGIN_ASSET_SCHEME = "plugin-asset"
+
 // Must be called *before* app is ready. Marking the scheme `standard` and
 // `secure` makes its origin behave like https for CORS, cookies, and CSP.
 protocol.registerSchemesAsPrivileged([
@@ -223,6 +234,16 @@ protocol.registerSchemesAsPrivileged([
       stream: true,
     },
   },
+  {
+    scheme: PLUGIN_ASSET_SCHEME,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+    },
+  },
 ])
 
 // Marketplace user avatars are served by GitHub (avatars + camo redirects).
@@ -231,7 +252,7 @@ const AVATAR_IMG_SRC = "https://*.githubusercontent.com"
 
 const PROD_CSP =
   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
-  `img-src 'self' data: blob: ${AVATAR_IMG_SRC}; font-src 'self' data:; connect-src 'self'; ` +
+  `img-src 'self' data: blob: ${AVATAR_IMG_SRC} ${PLUGIN_ASSET_SCHEME}:; font-src 'self' data:; connect-src 'self'; ` +
   "object-src 'none'; frame-src 'none'; base-uri 'self'; form-action 'self'"
 
 function devCsp(devOrigin: string): string {
@@ -240,7 +261,7 @@ function devCsp(devOrigin: string): string {
     `default-src 'self' ${devOrigin} ${ws}; ` +
     `script-src 'self' 'unsafe-inline' 'unsafe-eval' ${devOrigin}; ` +
     `style-src 'self' 'unsafe-inline' ${devOrigin}; ` +
-    `img-src 'self' data: blob: ${AVATAR_IMG_SRC} ${devOrigin}; ` +
+    `img-src 'self' data: blob: ${AVATAR_IMG_SRC} ${PLUGIN_ASSET_SCHEME}: ${devOrigin}; ` +
     `font-src 'self' data: ${devOrigin}; ` +
     `connect-src 'self' ${devOrigin} ${ws}`
   )
@@ -291,6 +312,31 @@ function registerStaticProtocol(): void {
 
 const launcher = new LauncherService()
 let plugins: PluginHost
+
+function registerPluginAssetProtocol(): void {
+  protocol.handle(PLUGIN_ASSET_SCHEME, async (request) => {
+    const url = new URL(request.url)
+    const pluginId = url.hostname
+    const entry = plugins?.registry.get(pluginId)
+    if (!entry) return new Response("Not Found", { status: 404 })
+
+    const resolved = await resolveSafePluginAssetPath(url.pathname, entry.rootDir)
+    if (resolved.kind === "forbidden") {
+      return new Response("Forbidden", { status: 403 })
+    }
+
+    const fileUrl = pathToFileURL(resolved.filePath).toString()
+    const response = await net.fetch(fileUrl, { bypassCustomProtocolHandlers: true })
+    if (!response.ok) return response
+    const headers = new Headers(response.headers)
+    headers.set("content-type", getContentType(resolved.filePath))
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    })
+  })
+}
 let capabilityService!: CapabilityIpcService
 let hostResourceIpcService!: HostResourceIpcService
 let approvalRegistry!: ApprovalRegistry
@@ -462,37 +508,45 @@ function bindCapabilityPromptLifecycle(win: BrowserWindow): void {
 }
 
 function registerIpc(): void {
-  ipcMain.handle("launcher:search", (_event, query: unknown) => {
+  ipcMain.handle("launcher:search", (event, query: unknown) => {
+    if (!isTrustedIpcSender(event)) return []
     return launcher.search(typeof query === "string" ? query : "")
   })
 
-  ipcMain.handle("launcher:launch", async (_event, id: unknown) => {
-    if (typeof id !== "string") return false
+  ipcMain.handle("launcher:launch", async (event, id: unknown) => {
+    if (!isTrustedIpcSender(event) || typeof id !== "string") return false
     const ok = await launcher.launchById(id)
     if (ok) hideSearchWindow()
     return ok
   })
 
-  ipcMain.handle("launcher:refresh", () => launcher.refreshApps())
+  ipcMain.handle("launcher:refresh", (event) => {
+    if (!isTrustedIpcSender(event)) return []
+    return launcher.refreshApps()
+  })
 
-  ipcMain.handle("launcher:frequent", (_event, limit: unknown) => {
+  ipcMain.handle("launcher:frequent", (event, limit: unknown) => {
+    if (!isTrustedIpcSender(event)) return []
     return launcher.getFrequentApps(typeof limit === "number" ? limit : undefined)
   })
 
-  ipcMain.handle("launcher:remove-frequent", (_event, id: unknown) => {
-    if (typeof id !== "string") return
+  ipcMain.handle("launcher:remove-frequent", (event, id: unknown) => {
+    if (!isTrustedIpcSender(event) || typeof id !== "string") return
     return launcher.removeFrequentApp(id)
   })
 
-  ipcMain.handle("launcher:pause-hotkey", () => {
+  ipcMain.handle("launcher:pause-hotkey", (event) => {
+    if (!isTrustedIpcSender(event)) return
     suspendGlobalShortcut()
   })
 
-  ipcMain.handle("launcher:resume-hotkey", () => {
+  ipcMain.handle("launcher:resume-hotkey", (event) => {
+    if (!isTrustedIpcSender(event)) return false
     return resumeGlobalShortcut(() => toggleSearchWindow(searchWindowDeps()))
   })
 
-  ipcMain.handle("launcher:hide", () => {
+  ipcMain.handle("launcher:hide", (event) => {
+    if (!isTrustedIpcSender(event)) return
     hideSearchWindow()
   })
 
@@ -516,39 +570,49 @@ function registerIpc(): void {
   })
 
   ipcMain.handle("window:set-title-bar-dimmed", (event, dimmed: unknown) => {
+    if (!isTrustedIpcSender(event)) return
     titleBarDimmed = dimmed === true
     const win = BrowserWindow.fromWebContents(event.sender)
     if (win) applyTitleBarScheme(win, launcher.getSettings().themeMode)
   })
 
   ipcMain.on("launcher:ready", (event) => {
+    if (!isTrustedIpcSender(event)) return
     markSearchWindowReady(event.sender)
   })
 
-  ipcMain.handle("floating-ball:toggle-menu", () => {
+  ipcMain.handle("floating-ball:toggle-menu", (event) => {
+    if (!isTrustedIpcSender(event)) return
     toggleFloatingBallMenu()
   })
 
-  ipcMain.handle("floating-ball:open-feature", (_event, feature: unknown) => {
+  ipcMain.handle("floating-ball:open-feature", (event, feature: unknown) => {
+    if (!isTrustedIpcSender(event)) return
     if (feature === "appLauncher") {
       openFloatingBallFeature(feature)
     }
   })
 
-  ipcMain.handle("floating-ball:hide", async () => {
+  ipcMain.handle("floating-ball:hide", async (event) => {
+    if (!isTrustedIpcSender(event)) return
     await disableFloatingBall()
   })
 
-  ipcMain.handle("floating-ball:move-by", (_event, delta: unknown) => {
+  ipcMain.handle("floating-ball:move-by", (event, delta: unknown) => {
+    if (!isTrustedIpcSender(event)) return
     if (!delta || typeof delta !== "object") return
     const value = delta as Record<string, unknown>
     if (typeof value.x !== "number" || typeof value.y !== "number") return
     moveFloatingBallBy({ x: value.x, y: value.y })
   })
 
-  ipcMain.handle("settings:get", () => launcher.getSettings())
+  ipcMain.handle("settings:get", (event) => {
+    if (!isTrustedIpcSender(event)) return undefined
+    return launcher.getSettings()
+  })
 
-  ipcMain.handle("settings:update", async (_event, patch: unknown) => {
+  ipcMain.handle("settings:update", async (event, patch: unknown) => {
+    if (!isTrustedIpcSender(event)) return undefined
     const previous = launcher.getSettings()
     let next = await launcher.updateSettings(coercePatch(patch))
 
@@ -571,9 +635,10 @@ function registerIpc(): void {
     return next
   })
 
-  ipcMain.handle("ai:list-execution-workspaces", (_event, workspaceId: unknown) =>
-    agent.listWorkspaceRoots(typeof workspaceId === "string" ? workspaceId : "default")
-  )
+  ipcMain.handle("ai:list-execution-workspaces", (event, workspaceId: unknown) => {
+    if (!isTrustedIpcSender(event)) return []
+    return agent.listWorkspaceRoots(typeof workspaceId === "string" ? workspaceId : "default")
+  })
 
   registerPluginIpc(ipcMain, plugins, {
     isTrustedSender: isTrustedIpcSender,
@@ -709,7 +774,7 @@ async function importSynapseFromOs(filePath: string): Promise<void> {
   }
 }
 
-function isTrustedIpcSender(event: IpcMainInvokeEvent): boolean {
+function isTrustedIpcSender(event: Pick<IpcMainInvokeEvent, "senderFrame" | "sender">): boolean {
   const url = event.senderFrame?.url || event.sender.getURL()
   let target: URL
   try {
@@ -959,13 +1024,13 @@ function initPluginHost(): PluginHost {
 
   capabilityService = new CapabilityIpcService(
     () => plugins,
-    createCapabilityPromptSender(broadcast),
+    createCapabilityPromptSender(broadcast, showMainWindow),
     approvalRegistry
   )
 
   hostResourceIpcService = new HostResourceIpcService(
     {
-      ...createHostResourcePromptSender(broadcast),
+      ...createHostResourcePromptSender(broadcast, showMainWindow),
       audit: hostResourceAudit,
     },
     approvalRegistry
@@ -977,6 +1042,10 @@ function initPluginHost(): PluginHost {
     marketplaceGetToken: () => marketplaceTokenStore().get(),
     userDataDir,
     resourcesDir: pluginResourcesDir(),
+    // __dirname here is this actual entry chunk's own folder (out/main/) —
+    // plugin-sandbox.ts can't safely compute this itself, since shared code
+    // can end up bundled into a different chunk with a different __dirname.
+    sandboxEntryScriptPath: path.join(__dirname, "plugin-runtime-entry.js"),
     adapters: createElectronPluginAdapters(userDataDir, {
       onNotificationAction: (notificationId, actionId) => {
         void hostRef?.bridge
@@ -1714,13 +1783,14 @@ function createMainWindow(): BrowserWindow {
   return win
 }
 
-function showMainWindow(): void {
+function showMainWindow(): BrowserWindow {
   if (!mainWindow || mainWindow.isDestroyed()) {
     mainWindow = createMainWindow()
   }
   if (mainWindow.isMinimized()) mainWindow.restore()
   mainWindow.show()
   mainWindow.focus()
+  return mainWindow
 }
 
 function rebindHotkey(accelerator: string): boolean {
@@ -1729,6 +1799,24 @@ function rebindHotkey(accelerator: string): boolean {
     logger.child("synapse").warn("failed to register global shortcut", { accelerator })
   }
   return ok
+}
+
+/**
+ * Startup-only variant of {@link rebindHotkey}. Registration can fail
+ * transiently right after an electron-vite dev hot-restart — the previous
+ * process may still be tearing down (reaping plugin utilityProcess
+ * children) when the new process starts, so the OS briefly still reports
+ * the accelerator as owned by it. Retrying a few times clears this up
+ * without the user having to manually re-capture the hotkey. Runs
+ * fire-and-forget so a slow retry sequence never delays tray/window setup.
+ */
+async function rebindHotkeyAtStartup(accelerator: string): Promise<void> {
+  const ok = await bindGlobalShortcutWithRetry(accelerator, () =>
+    toggleSearchWindow(searchWindowDeps())
+  )
+  if (!ok) {
+    logger.child("synapse").warn("failed to register global shortcut", { accelerator })
+  }
 }
 
 function trayActions() {
@@ -1828,6 +1916,7 @@ if (isMcpStdioMode) {
 
       applyCsp()
       registerStaticProtocol()
+      registerPluginAssetProtocol()
       // Reconcile only artifacts interrupted by a prior process before any
       // driver or GC can start. This settles manifest-backed captures exactly
       // and removes unmanifested debris; doing it from a normal GC sweep
@@ -1886,6 +1975,7 @@ if (isMcpStdioMode) {
       headlessApprovalServer = await startHeadlessApprovalServer({
         approveCapability: capabilityService.capabilityApprover,
         approveHostResource: hostResourceIpcService.hostResourceApprover,
+        promptForGrant: capabilityService.grantPrompt,
         portFilePath: path.join(app.getPath("userData"), "mcp-approval.json"),
       })
 
@@ -1931,7 +2021,7 @@ if (isMcpStdioMode) {
       }
 
       createTray(defaultTrayIcon(), trayActions())
-      rebindHotkey(settings.hotkey)
+      void rebindHotkeyAtStartup(settings.hotkey)
       syncFloatingBallWindow(floatingBallDeps())
       showStartupNotification({
         hotkey: settings.hotkey,
