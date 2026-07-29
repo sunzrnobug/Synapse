@@ -45,7 +45,8 @@ describe("localPolicyBackendDescriptor — honest reality labels", () => {
 
 describe("createLocalPolicyExecutionBackend", () => {
   // Real powershell.exe spawn — see command-runner.test.ts for why this
-  // needs margin + retry above Vitest's 5s default on a loaded CI runner.
+  // needs an explicit timeoutMs (below the outer test timeout, so
+  // runCommand always self-terminates cleanly) plus margin + retry.
   it(
     "actually runs the command through the same runCommand path",
     { timeout: 20_000, retry: 2 },
@@ -56,7 +57,7 @@ describe("createLocalPolicyExecutionBackend", () => {
       const command = process.platform === "win32" ? "Write-Output ok" : "echo ok"
 
       const result = await backend.invoke(
-        { invocationId: "inv-1", rootId: "repo", command },
+        { invocationId: "inv-1", rootId: "repo", command, timeoutMs: 10_000 },
         policy
       )
       expect(result.exitCode).toBe(0)

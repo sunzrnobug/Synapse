@@ -327,8 +327,9 @@ function asStream(value: string | RunCommandStreamPayload | undefined): RunComma
 }
 
 // Real powershell.exe spawns throughout this block — see
-// command-runner.test.ts for why these need margin + retry above Vitest's
-// 5s default on a loaded CI runner.
+// command-runner.test.ts for why each call passes an explicit timeoutMs
+// (below the outer test timeout, so runCommand always self-terminates
+// cleanly instead of leaving an orphaned process) plus margin + retry.
 const realProcessTest = { timeout: 20_000, retry: 2 }
 
 describe("executionToolHostSource — run_command artifact-backed capture (Task 18)", () => {
@@ -355,7 +356,7 @@ describe("executionToolHostSource — run_command artifact-backed capture (Task 
       const command = process.platform === "win32" ? "Write-Output ok" : "echo ok"
       const result = await source.invokeTool(
         "execution:core/run_command",
-        { rootId: "repo", command },
+        { rootId: "repo", command, timeoutMs: 10_000 },
         { caller: { kind: "agent", conversationId: "c1", workspaceId: "w1", runId: "run-1" } }
       )
       expect(result.isError).toBeFalsy()
@@ -392,7 +393,7 @@ describe("executionToolHostSource — run_command artifact-backed capture (Task 
       const command = process.platform === "win32" ? "Write-Output ok" : "echo ok"
       const result = await source.invokeTool(
         "execution:core/run_command",
-        { rootId: "repo", command },
+        { rootId: "repo", command, timeoutMs: 10_000 },
         { caller: { kind: "agent", conversationId: "c1", workspaceId: "w1" } } // no runId
       )
       const payload = payloadOf(result)
@@ -424,7 +425,7 @@ describe("executionToolHostSource — run_command artifact-backed capture (Task 
       const command = process.platform === "win32" ? "Write-Output ok" : "echo ok"
       const result = await source.invokeTool(
         "execution:core/run_command",
-        { rootId: "repo", command },
+        { rootId: "repo", command, timeoutMs: 10_000 },
         { caller: { kind: "agent", workspaceId: "w1", runId: "root-run-2" } }
       )
       const payload = payloadOf(result)
@@ -459,7 +460,7 @@ describe("executionToolHostSource — run_command artifact-backed capture (Task 
       const command = process.platform === "win32" ? "Write-Output ok" : "echo ok"
       const result = await source.invokeTool(
         "execution:core/run_command",
-        { rootId: "repo", command },
+        { rootId: "repo", command, timeoutMs: 10_000 },
         {
           caller: {
             kind: "subagent",
@@ -508,7 +509,7 @@ describe("executionToolHostSource — run_command artifact-backed capture (Task 
           : `node -e "process.stdout.write('a'.repeat(${size}))"`
       const result = await source.invokeTool(
         "execution:core/run_command",
-        { rootId: "repo", command },
+        { rootId: "repo", command, timeoutMs: 10_000 },
         { caller: { kind: "agent", workspaceId: "w1", runId: "run-limit-1" } }
       )
       const payload = payloadOf(result)
@@ -549,7 +550,7 @@ describe("executionToolHostSource — run_command artifact-backed capture (Task 
       const command = process.platform === "win32" ? "Write-Output ok" : "echo ok"
       const result = await source.invokeTool(
         "execution:core/run_command",
-        { rootId: "repo", command },
+        { rootId: "repo", command, timeoutMs: 10_000 },
         { caller: { kind: "agent", workspaceId: "w1", runId: "run-audit-1" } }
       )
       const payload = payloadOf(result)

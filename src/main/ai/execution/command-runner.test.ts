@@ -45,22 +45,25 @@ async function writeScript(dir: string, name: string, source: string): Promise<s
 
 describe("runCommand — legacy in-memory path (no artifacts option)", () => {
   // Real powershell.exe spawns. Vitest's default 5s test timeout has no
-  // margin for one, and CI load has been observed pushing a bare spawn past
-  // even a 15s/30s single-attempt window on a busy runner (a different
-  // real-process test trips this each time, never the same one twice —
-  // consistent with transient scheduling contention on a shared CI runner,
-  // not a deterministic hang). Worse than an ordinary flaky failure: when
-  // Vitest abandons a timed-out test it never kills the underlying child
-  // process, so the orphaned runCommand() keeps running and holds a
-  // Windows-exclusive file lock inside its temp workspace — corrupting
-  // every later test's fs.rm() cleanup with EBUSY/ENOTEMPTY. A retry (the
-  // standard mitigation for CI-load-sensitive real-process tests) is more
-  // robust here than an ever-larger single-attempt timeout.
+  // margin for one. Two things matter here, not just one:
+  // 1. An explicit runCommand `timeoutMs` well below the outer Vitest
+  //    timeout, so runCommand's OWN kill logic always fires first. Without
+  //    this, a slow/contended CI moment can make Vitest abandon the test
+  //    before runCommand's (30s-default) internal timer ever fires — and
+  //    Vitest never kills the underlying child process on its own, so the
+  //    orphan keeps running and holds a Windows-exclusive file lock inside
+  //    its temp workspace, corrupting every later test's fs.rm() cleanup
+  //    with EBUSY/ENOTEMPTY. Bounding runCommand's own timeout guarantees a
+  //    clean, timely return (timedOut:true in the worst case) instead of an
+  //    orphan, regardless of how contended the runner is.
+  // 2. retry (the standard mitigation for CI-load-sensitive real-process
+  //    tests), for the rare case (1) still produces a slow-but-not-hung
+  //    result that fails this test's assertions.
   it("runs a simple command with exit code 0", { timeout: 20_000, retry: 2 }, async () => {
     const root = await makeWorkspace()
     const policy = new WorkspacePolicy([{ id: "repo", root }])
     const command = process.platform === "win32" ? "Write-Output ok" : "echo ok"
-    const result = await runCommand(policy, { rootId: "repo", command })
+    const result = await runCommand(policy, { rootId: "repo", command, timeoutMs: 10_000 })
     expect(result.exitCode).toBe(0)
     expect(result.legacyStdout).toContain("ok")
     expect(result.stdout).toBeUndefined()
@@ -116,6 +119,7 @@ describe("runCommand — artifact-backed capture path", () => {
       const result = await runCommand(policy, {
         rootId: "repo",
         command,
+        timeoutMs: 10_000,
         artifacts: { store, owner: owner() },
       })
 
@@ -149,6 +153,7 @@ describe("runCommand — artifact-backed capture path", () => {
       const result = await runCommand(policy, {
         rootId: "repo",
         command,
+        timeoutMs: 10_000,
         artifacts: { store, owner: owner() },
       })
 
