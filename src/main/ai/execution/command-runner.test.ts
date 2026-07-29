@@ -64,11 +64,6 @@ describe("runCommand — legacy in-memory path (no artifacts option)", () => {
     const policy = new WorkspacePolicy([{ id: "repo", root }])
     const command = process.platform === "win32" ? "Write-Output ok" : "echo ok"
     const result = await runCommand(policy, { rootId: "repo", command, timeoutMs: 10_000 })
-    if (result.exitCode !== 0) {
-      console.error(
-        `[DIAG] exitCode=${result.exitCode} timedOut=${result.timedOut} stdout=${JSON.stringify(result.legacyStdout)} stderr=${JSON.stringify(result.legacyStderr)}`
-      )
-    }
     expect(result.exitCode).toBe(0)
     expect(result.legacyStdout).toContain("ok")
     expect(result.stdout).toBeUndefined()

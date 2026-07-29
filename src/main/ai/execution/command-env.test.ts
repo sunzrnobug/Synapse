@@ -17,6 +17,19 @@ describe("sandboxCommandEnv", () => {
       LC_ALL: "en_US.UTF-8",
       LC_CTYPE: "en_US.UTF-8",
       LANGUAGE: "en_US",
+      // Windows PowerShell startup path/module resolution — none of these
+      // are secrets, just standard per-machine system locations. Missing
+      // them has been observed causing powershell.exe to hang indefinitely
+      // on startup (before running any command) on some Windows CI images,
+      // rather than merely running slowly.
+      PSModulePath: "C:\\Program Files\\WindowsPowerShell\\Modules",
+      ProgramFiles: "C:\\Program Files",
+      "ProgramFiles(x86)": "C:\\Program Files (x86)",
+      ProgramData: "C:\\ProgramData",
+      APPDATA: "C:\\Users\\user\\AppData\\Roaming",
+      LOCALAPPDATA: "C:\\Users\\user\\AppData\\Local",
+      NUMBER_OF_PROCESSORS: "4",
+      PROCESSOR_ARCHITECTURE: "AMD64",
     }
     expect(sandboxCommandEnv(source)).toEqual(source)
   })

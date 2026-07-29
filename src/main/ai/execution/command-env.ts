@@ -26,6 +26,19 @@ const ALLOWED_KEYS = new Set([
   "LC_ALL",
   "LC_CTYPE",
   "LANGUAGE",
+  // Windows PowerShell (powershell.exe) startup path/module resolution.
+  // None of these are secrets — just standard per-machine system
+  // locations — but missing them has been observed causing powershell.exe
+  // to hang indefinitely on startup (before it even runs the given
+  // command) on some Windows CI images, rather than merely running slowly.
+  "PSModulePath",
+  "ProgramFiles",
+  "ProgramFiles(x86)",
+  "ProgramData",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "NUMBER_OF_PROCESSORS",
+  "PROCESSOR_ARCHITECTURE",
 ])
 
 /**
