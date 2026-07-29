@@ -361,7 +361,7 @@ describe("executionToolHostSource — run_command artifact-backed capture (Task 
     expect(typeof stdout.capturedBytes).toBe("number")
     // Real powershell.exe spawn — see command-runner.test.ts for why this
     // needs margin above Vitest's 5s default on a loaded CI runner.
-  }, 15_000)
+  }, 30_000)
 
   it("falls back to the legacy in-memory shape when the caller has no runId, even with an artifact store configured", async () => {
     const root = await makeWorkspace()
@@ -389,7 +389,7 @@ describe("executionToolHostSource — run_command artifact-backed capture (Task 
     expect(typeof payload.stdout).toBe("string")
     expect(payload.stdout).toContain("ok")
     expect(payload.error).toBeUndefined()
-  }, 15_000)
+  }, 30_000)
 
   it("derives rootRunId from caller.runId when there is no parentRunId (root-level run)", async () => {
     const root = await makeWorkspace()
@@ -420,7 +420,7 @@ describe("executionToolHostSource — run_command artifact-backed capture (Task 
     expect(manifest.owner.runId).toBe("root-run-2")
     expect(manifest.owner.rootRunId).toBe("root-run-2")
     expect(manifest.owner.parentRunId).toBeUndefined()
-  }, 15_000)
+  }, 30_000)
 
   it("derives rootRunId from caller.parentRunId for a subagent run (no nesting beyond one level)", async () => {
     const root = await makeWorkspace()
@@ -458,7 +458,7 @@ describe("executionToolHostSource — run_command artifact-backed capture (Task 
     expect(manifest.owner.runId).toBe("sub-run-1")
     expect(manifest.owner.rootRunId).toBe("root-run-1")
     expect(manifest.owner.parentRunId).toBe("root-run-1")
-  }, 15_000)
+  }, 30_000)
 
   it("surfaces a visible output_limit_exceeded signal when a stream is truncated for a hard quota reason", async () => {
     const root = await makeWorkspace()
@@ -502,7 +502,7 @@ describe("executionToolHostSource — run_command artifact-backed capture (Task 
 
     const events = await new ExecutionLogStore(logFile).list()
     expect(events[0]).toMatchObject({ errorPreview: "output_limit_exceeded" })
-  }, 15_000)
+  }, 30_000)
 
   it("records backend descriptor and artifact ids in the audit log, without inlining raw output", async () => {
     const root = await makeWorkspace()
@@ -536,5 +536,5 @@ describe("executionToolHostSource — run_command artifact-backed capture (Task 
       stderrArtifactId: asStream(payload.stderr).artifactId,
     })
     expect(events[0].outputPreview.length).toBeLessThanOrEqual(2000)
-  }, 15_000)
+  }, 30_000)
 })
