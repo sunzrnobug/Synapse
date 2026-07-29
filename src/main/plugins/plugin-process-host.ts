@@ -9,7 +9,7 @@ import type {
   ToolResult,
   View,
 } from "@synapse/plugin-sdk"
-import type { PluginBridge } from "./plugin-bridge"
+import type { ClipboardWatchHandle, PluginBridge } from "./plugin-bridge"
 import type {
   CapabilityCallMessage,
   ChildToHostMessage,
@@ -714,14 +714,32 @@ export class PluginProcessHost {
     const listenerId = nextCallId("watch")
     const unwatch = capabilitiesOf(ctx).clipboard.watch((content: ClipboardContent) => {
       proc.handle.postMessage({ type: "clipboard-changed", listenerId, content })
-    })
+    }) as ClipboardWatchHandle
     proc.clipboardWatches.set(listenerId, unwatch)
-    proc.handle.postMessage({
-      type: "capability-call-result",
-      callId: msg.callId,
-      ok: true,
-      value: { listenerId },
-    })
+    // Hold the result until the capability gate actually settles — see
+    // ClipboardWatchHandle's doc comment. Responding eagerly (on the
+    // synchronous return of clipboard.watch()) would tell the child the
+    // watch is live before a not-yet-granted capability's prompt/grant has
+    // even resolved, and would silently swallow a denial instead of
+    // surfacing it to the child as an error.
+    unwatch.ready
+      .then(() => {
+        proc.handle.postMessage({
+          type: "capability-call-result",
+          callId: msg.callId,
+          ok: true,
+          value: { listenerId },
+        })
+      })
+      .catch((err) => {
+        proc.clipboardWatches.delete(listenerId)
+        proc.handle.postMessage({
+          type: "capability-call-result",
+          callId: msg.callId,
+          ok: false,
+          error: serializeError(err),
+        })
+      })
   }
 
   private handleClipboardUnwatch(proc: ManagedProcess, msg: CapabilityCallMessage): void {

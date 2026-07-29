@@ -133,6 +133,14 @@ type PluginCapabilities = Pick<
   "storage" | "clipboard" | "notifications" | "system" | "network" | "fs" | "credentials" | "log"
 >
 
+/** `clipboard.watch`'s public SDK signature returns a plain synchronous
+ *  unwatch function — real plugin code depends on that shape. This host-only
+ *  extension attaches the underlying capability-gate settlement as a
+ *  `.ready` property on the SAME function object, so plugin-process-host.ts's
+ *  IPC dispatcher (the only real caller of this method) can await it without
+ *  changing the public contract. */
+export type ClipboardWatchHandle = (() => void) & { ready: Promise<void> }
+
 interface StorageState {
   loaded: boolean
   data: Record<string, unknown>
@@ -578,11 +586,22 @@ export class PluginBridge {
     gate: CapabilityGatePort,
     invocation: InvocationContext,
     listener: (content: ClipboardContent) => void
-  ): () => void {
+  ): ClipboardWatchHandle {
     let unwatch: (() => void) | undefined
     let cancelled = false
 
-    void gate
+    // `ready` lets the IPC dispatcher (plugin-process-host.ts's
+    // handleClipboardWatch, the only real caller) hold its
+    // capability-call-result until the gate has actually settled — a
+    // not-yet-granted capability's grant() write is asynchronous, so
+    // responding before this resolves would tell the child the watch is
+    // live before it is (or ever will be, if denied), and let that write
+    // straggle out past whatever the caller does next. Attached as a
+    // property on the returned function rather than changing the return
+    // type to a Promise, since `clipboard.watch`'s public SDK signature
+    // ((listener) => unwatch) is a synchronous listener-registration API
+    // that real plugin code depends on.
+    const ready = gate
       .ensure({
         capability: "clipboard:watch",
         invocation,
@@ -593,14 +612,16 @@ export class PluginBridge {
         if (cancelled) return
         unwatch = this.watchClipboard(pluginId, listener)
       })
-      .catch((err) => {
-        logger.child(`plugin:${pluginId}`).warn("clipboard watch denied", { err })
-      })
+    ready.catch((err) => {
+      logger.child(`plugin:${pluginId}`).warn("clipboard watch denied", { err })
+    })
 
-    return () => {
+    const stop: ClipboardWatchHandle = () => {
       cancelled = true
       unwatch?.()
     }
+    stop.ready = ready
+    return stop
   }
 
   async disposePlugin(pluginId: string): Promise<void> {

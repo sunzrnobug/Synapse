@@ -1,4 +1,5 @@
 import type { PluginContext } from "@synapse/plugin-sdk"
+import type { ApprovalResult } from "../approvals/types"
 import type {
   ChildToHostMessage,
   HostToChildMessage,
@@ -12,6 +13,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { CapabilityDenied } from "./capability-gate"
+import { createCapabilityGovernance } from "./capability-governance"
 import { PermissionDenied } from "./permissions"
 import { PluginBridge } from "./plugin-bridge"
 import {
@@ -65,7 +67,9 @@ function fakeChild() {
 
 type FakeChild = ReturnType<typeof fakeChild>
 
-function bridgeForTest(): PluginBridge {
+function bridgeForTest(
+  overrides: { prompt?: Parameters<typeof createCapabilityGovernance>[0]["prompt"] } = {}
+): PluginBridge {
   return new PluginBridge({
     userDataDir: dir,
     adapters: {
@@ -78,6 +82,9 @@ function bridgeForTest(): PluginBridge {
       },
     },
     storageFlushMs: 0,
+    governance: overrides.prompt
+      ? createCapabilityGovernance({ userDataDir: dir, prompt: overrides.prompt })
+      : undefined,
   })
 }
 
@@ -780,6 +787,84 @@ describe("pluginProcessHost — capability-call dispatch", () => {
           .find((m) => (m as { callId: string }).callId === "unwatch1")
       ).toBeTruthy()
     )
+
+    child.send({
+      type: "invoke-command-result",
+      callId: invokeMsg.callId,
+      ok: true,
+      value: undefined,
+    })
+    await promise
+  })
+
+  it("does not post clipboard.watch's capability-call-result until the capability gate settles", async () => {
+    // A real prompt round-trip (first-time consent, or grant persistence)
+    // is asynchronous. If the host responded to the child eagerly — before
+    // this settles — the child would believe the watch is live when the
+    // gate might still deny it, and (as this exact race caused in
+    // production) the response could race the write to disk that a
+    // just-granted capability triggers.
+    let resolvePrompt: (result: ApprovalResult) => void = () => {}
+    const promptGate = new Promise<ApprovalResult>((resolve) => {
+      resolvePrompt = resolve
+    })
+    const { host, children } = hostForTest({ bridge: bridgeForTest({ prompt: () => promptGate }) })
+    const { child } = await loadPlugin(host, children)
+
+    const promise = host.invokeCommand({
+      pluginId: "com.synapse.test",
+      commandId: "test.run",
+      phase: "run",
+    })
+    const invokeMsg = await waitForMessage(child, "invoke-command")
+
+    child.send({
+      type: "capability-call",
+      callId: "watch1",
+      invocationId: invokeMsg.invocationId,
+      capability: "clipboard.watch",
+      args: [],
+    })
+
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(child.lastOfType("capability-call-result")).toBeUndefined()
+
+    resolvePrompt({ allow: true })
+    await vi.waitFor(() => expect(child.lastOfType("capability-call-result")).toBeTruthy())
+    expect(child.lastOfType("capability-call-result")).toMatchObject({ ok: true })
+
+    child.send({
+      type: "invoke-command-result",
+      callId: invokeMsg.callId,
+      ok: true,
+      value: undefined,
+    })
+    await promise
+  })
+
+  it("posts an error capability-call-result when clipboard.watch's capability grant is refused", async () => {
+    const { host, children } = hostForTest({
+      bridge: bridgeForTest({ prompt: async () => ({ allow: false }) }),
+    })
+    const { child } = await loadPlugin(host, children)
+
+    const promise = host.invokeCommand({
+      pluginId: "com.synapse.test",
+      commandId: "test.run",
+      phase: "run",
+    })
+    const invokeMsg = await waitForMessage(child, "invoke-command")
+
+    child.send({
+      type: "capability-call",
+      callId: "watch1",
+      invocationId: invokeMsg.invocationId,
+      capability: "clipboard.watch",
+      args: [],
+    })
+
+    await vi.waitFor(() => expect(child.lastOfType("capability-call-result")).toBeTruthy())
+    expect(child.lastOfType("capability-call-result")).toMatchObject({ ok: false })
 
     child.send({
       type: "invoke-command-result",
