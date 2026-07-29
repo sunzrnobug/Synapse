@@ -241,30 +241,30 @@ describe("runCommand — artifact-backed capture path", () => {
       scriptDir,
       "trickle.js",
       [
-        "let i = 0",
         "function loop() {",
-        "  if (i++ < 100000) {",
-        "    process.stdout.write('o'.repeat(200))",
-        "    process.stderr.write('e'.repeat(200))",
-        "    setImmediate(loop)",
-        "  }",
+        "  process.stdout.write('o'.repeat(200))",
+        "  process.stderr.write('e'.repeat(200))",
+        "  setImmediate(loop)",
         "}",
         "loop()",
       ].join("\n")
     )
     const command = `node "${script}"`
 
-    // Generous enough for node.exe's own startup (which can itself take
-    // well over 100ms) to complete and several setImmediate iterations to
-    // flow before the timeout fires. The tight, uncapped setImmediate
-    // loop above (as opposed to a slow interval) keeps a steady backlog
-    // of unconsumed chunks queued on both streams at essentially any
-    // instant, so whenever the kill/abort actually lands, capture()'s
-    // per-chunk producer.signal check gets a real chance to observe it —
-    // a timeout racing a source that's already gone idle (nothing left
-    // to check the signal against before EOF) can't reliably distinguish
-    // "correctly marked producer-aborted" from capture()'s own signal
-    // check simply never getting invoked again.
+    // Loops unconditionally rather than to a fixed iteration count: the
+    // process is force-killed by the timeout/abort regardless, so there is
+    // no natural end for it to race against. A fixed count risked finishing
+    // on its own before the timeout fired on a fast machine, making the
+    // test flaky in the opposite direction (timedOut/cancelled ending up
+    // false because the process exited normally first). The tight,
+    // uncapped setImmediate loop (as opposed to a slow interval) keeps a
+    // steady backlog of unconsumed chunks queued on both streams at
+    // essentially any instant, so whenever the kill/abort actually lands,
+    // capture()'s per-chunk producer.signal check gets a real chance to
+    // observe it — a timeout racing a source that's already gone idle
+    // (nothing left to check the signal against before EOF) can't reliably
+    // distinguish "correctly marked producer-aborted" from capture()'s own
+    // signal check simply never getting invoked again.
     const result = await runCommand(policy, {
       rootId: "repo",
       command,
@@ -289,13 +289,10 @@ describe("runCommand — artifact-backed capture path", () => {
       scriptDir,
       "trickle.js",
       [
-        "let i = 0",
         "function loop() {",
-        "  if (i++ < 100000) {",
-        "    process.stdout.write('o'.repeat(200))",
-        "    process.stderr.write('e'.repeat(200))",
-        "    setImmediate(loop)",
-        "  }",
+        "  process.stdout.write('o'.repeat(200))",
+        "  process.stderr.write('e'.repeat(200))",
+        "  setImmediate(loop)",
         "}",
         "loop()",
       ].join("\n")
